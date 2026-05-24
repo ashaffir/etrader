@@ -9,8 +9,10 @@ The bot:
 1. Loads tracked instruments (a curated baseline + optional LLM-suggested
    rotations) into a refreshable universe.
 2. Pulls live prices and OHLCV candles every cycle.
-3. Computes deterministic indicators (SMA cross, RSI, momentum) into a
-   shortlist of BUY / CLOSE candidates.
+3. Runs a **weighted ensemble** of price-action indicators (SMA cross,
+   EMA cross, RSI, MACD, Bollinger, Donchian, momentum) and produces a
+   shortlist of BUY / CLOSE candidates whenever the combined score
+   crosses the configurable entry / exit thresholds.
 4. Runs an extensible **tool catalog** (~18 tools across price / volume /
    context families) against each candidate. A regime-aware selector picks
    the relevant subset per (instrument, cycle); hard gates like
@@ -21,6 +23,16 @@ The bot:
 6. Applies guardrails (cap, parallel limit, cooldown, daily-loss stop, paper
    gate) and either executes or simulates the trades.
 7. Verifies trades by re-reading the portfolio after the eToro 10s cache.
+8. Persists state (`data/bot_state.json`), pushes alerts, and snapshots
+   telemetry that the Telegram service reads through the internal HTTP
+   control API.
+
+Two processes:
+
+- **`python -m src.main`** — the trading bot (cycle loop + control HTTP server).
+- **`python -m src.telegram_service`** — the Telegram bot (long-polling +
+  alert drain + inline-keyboard menus). Optional; the trading bot runs
+  fine without it.
 
 Everything is logged to stdout (colored) and to a rotating file.
 
@@ -28,50 +40,81 @@ Everything is logged to stdout (colored) and to a rotating file.
 
 ```
 etrader/
-├── .env                       # eToro + Azure + Telegram credentials
-├── config.toml                # behaviour defaults — guardrails, ops, universe, AI, control
+├── .env                       # eToro + Azure + Telegram credentials (gitignored)
+├── .gitignore                 # ignores .env, data/*, logs/*, .venv, caches, IDE
+├── config.toml                # behaviour defaults — guardrails, ops, universe, strategy, tools, AI, control, alerting
 ├── requirements.txt           # runtime deps: requests, openai
+├── data/                      # bot-managed runtime state (gitignored)
+│   ├── bot_state.json         # cooldowns, owned positions, daily-loss baseline, paused flag
+│   ├── config.sqlite          # persisted overrides for any [guardrails]/etc. edited at runtime
+│   ├── instrument_cache.json  # symbol → instrumentID resolution cache
+│   ├── trade_history.jsonl    # append-only execution log (read by /history)
+│   ├── tool_performance.jsonl # rolling per-tool hit-rate stats
+│   └── alert_subscriptions.json # per-chat /alerts toggles
+├── logs/                      # rotating trader.log
 ├── src/
 │   ├── main.py                # trading bot entry: `python -m src.main`
-│   ├── config.py              # .env + TOML loader, schema validation
+│   ├── config.py              # .env + TOML + SQLite override loader, schema validation
+│   ├── config_store/          # SQLite-backed runtime override store
 │   ├── logging_setup.py       # colored stdout + rotating file logger
 │   ├── state.py               # in-memory bot state (cooldowns, baseline, owned IDs)
 │   ├── persistence.py         # save/load BotState to data/bot_state.json
 │   ├── trade_history.py       # append-only data/trade_history.jsonl
 │   ├── telemetry.py           # in-memory snapshot store (read by Telegram)
+│   ├── alerts.py              # AlertHub + per-chat AlertSubscriptions (Telegram /alerts feed)
+│   ├── cycle.py               # one full cycle: fetch → score → decide → risk-gate → execute
 │   ├── etoro/                 # API client + endpoint wrappers
 │   ├── ai/                    # Azure Foundry chat client + prompts (incl. Q&A)
 │   ├── strategy/              # indicators, signals, decisions, universe, risk
+│   │   ├── ensemble.py        # weighted score combiner across price tools
+│   │   ├── signals.py         # turns indicator scores into BUY / CLOSE candidates
+│   │   ├── decisions.py       # LLM (or deterministic) decision engine
+│   │   ├── tools/             # extensible tool catalog + selector + perf log
+│   │   │   ├── registry.py
+│   │   │   ├── selector.py    # picks tools per (instrument, cycle)
+│   │   │   ├── price/         # SMA / RSI / MACD / Bollinger / Donchian / momentum
+│   │   │   ├── volume_tools.py
+│   │   │   └── context_tools.py # market_hours, spread_filter, regime, higher-TF
+│   │   ├── tool_orchestration.py
+│   │   ├── performance.py     # rolling hit-rate tracker
+│   │   ├── regime.py          # cross-asset trending/ranging classifier
+│   │   ├── risk.py            # guardrails + daily-loss kill switch
+│   │   └── universe.py        # base + LLM-rotated tracked instrument set
 │   ├── execution/             # executor (paper/live) + position monitor
 │   ├── control/               # internal HTTP control API (consumed by Telegram)
-│   │   ├── controller.py      # thread-safe pause/resume/panic/ask facade
+│   │   ├── controller.py      # thread-safe pause/resume/panic/ask/alerts facade
 │   │   ├── server.py          # stdlib HTTP server with bearer-token auth
 │   │   └── handlers.py        # JSON endpoint dispatch table
 │   └── telegram_service/      # SEPARATE PROCESS: Telegram bot poller + dispatcher
 │       ├── __main__.py        # entry: `python -m src.telegram_service`
-│       ├── bot.py             # long-polling loop
+│       ├── bot.py             # long-polling loop + alert drain + callback dispatch
 │       ├── commands.py        # parse + dispatch /commands and free-text
+│       ├── alerts_menu.py     # /alerts inline-keyboard rendering + callback parsing
 │       ├── control_client.py  # requests-based HTTP client for src.control
-│       ├── telegram_api.py    # raw Bot API calls (getUpdates, sendMessage)
+│       ├── telegram_api.py    # raw Bot API: getUpdates, sendMessage, callback queries
 │       └── formatters.py      # render JSON responses as Telegram text
-└── tests/                     # unit tests (stdlib unittest)
+└── tests/                     # unit tests (stdlib unittest, 256 cases)
 ```
 
 ## Setup
 
 ```bash
-# 1. Make sure .env is populated (PUBLIC_KEY, PRIVATE_KEY, AZURE_*).
+# 1. Make sure .env is populated (PUBLIC_KEY, PRIVATE_KEY, AZURE_*,
+#    plus TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOWED_CHAT_IDS /
+#    INTERNAL_API_TOKEN if you want the Telegram surface).
 # 2. Create a venv and install deps.
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
 
-# 3. Run the bot
+# 3. Run the trading bot
 python -m src.main
 
-# 4. Run tests
-python -m unittest discover -s tests -v
+# 4. (optional, separate shell) Run the Telegram service
+python -m src.telegram_service
 ```
+
+See *Tests* below for running the unit-test suite.
 
 ## Mode
 
@@ -83,14 +126,77 @@ python -m unittest discover -s tests -v
 
 ## Guardrails
 
-| Limit                            | Default | Where to change         |
-|----------------------------------|---------|-------------------------|
-| Max cash per trade               | $500    | `config.toml` `[guardrails]` |
-| Max parallel positions (bot-owned) | 10    | same                     |
-| Daily-loss kill switch           | $250    | same                     |
-| Per-instrument cooldown          | 60 min  | same                     |
-| Default stop-loss                | 5%      | same                     |
-| Default take-profit              | 8%      | same                     |
+| Limit                              | Default | Where to change                |
+|------------------------------------|---------|--------------------------------|
+| Max cash per trade                 | $500    | `config.toml` `[guardrails]`   |
+| Max parallel positions (bot-owned) | 10      | same                           |
+| Daily-loss kill switch             | $250    | same                           |
+| Per-instrument cooldown            | 60 min  | same                           |
+| Default stop-loss                  | 5%      | same                           |
+| Default take-profit                | 8%      | same                           |
+| Max leverage                       | 1       | same                           |
+
+Guardrails are also **editable at runtime** via Telegram (`/set <key>
+<value>`). Edits go to a tiny SQLite override store
+(`data/config.sqlite`) so they survive restarts — see the
+*Configuration* section below.
+
+## Configuration
+
+The bot resolves configuration in three layers (highest precedence
+wins):
+
+1. **Dataclass field defaults** — what you get if no other source
+   defines a value.
+2. **`config.toml`** — bootstrap defaults you ship with the repo.
+3. **`data/config.sqlite`** — runtime overrides written by Telegram
+   `/set` calls.
+
+On first run the merged defaults are snapshotted into the SQLite
+store, so subsequent restarts are DB-authoritative even if someone
+edits `config.toml` later. To reset a section to TOML defaults, delete
+its rows from `data/config.sqlite` (or just `rm data/config.sqlite` to
+re-snapshot from scratch).
+
+Sections persisted in the override DB: `[guardrails]`, `[operations]`,
+`[universe]`, `[strategy]`, `[ai]`, `[tools]`, `[logging]`. Secrets and
+the `[control]` / `[alerting]` plumbing remain `.env` / TOML-only.
+
+## Strategy
+
+The candidate-selection layer is a **weighted ensemble** over price
+indicators. Each enabled indicator emits a signed score in `[-1, +1]`;
+the ensemble's `raw_score` is the weight-normalized sum:
+
+```
+raw_score = Σ(weight_i * score_i) / Σ(|weight_i|)
+
+raw_score >=  min_signal_strength  → BUY candidate (unowned instrument)
+raw_score <= -min_exit_strength    → CLOSE candidate (bot-owned)
+```
+
+Defaults: `min_signal_strength=0.40`, `min_exit_strength=0.25` —
+exits trip on a weaker signal than entries so the bot cuts losers
+fast. Each component (SMA cross, EMA cross, RSI, MACD, Bollinger,
+Donchian, momentum) has its own weight in `[strategy]`; set a weight
+to `0.0` to disable that indicator's vote without removing it from
+the broader tool catalog.
+
+Surviving candidates are then passed through the **tool catalog** in
+`src/strategy/tools/`. Tools run in three families:
+
+- **price** — SMA / RSI / MACD / Bollinger / Donchian / momentum (~6 tools)
+- **volume** — volume-weighted features (~3 tools)
+- **context** — market hours, spread filter, regime, higher-timeframe
+  alignment, news feed (~6 tools)
+
+A selector picks an asset-class-compatible subset per (instrument,
+cycle) using rolling per-tool hit-rate. Hard gates like
+`market_hours` and `spread_filter` can veto a candidate **before any
+LLM call** so we don't burn tokens on unactionable trades.
+
+The full live rule set, tool list, and rolling performance is
+introspectable from Telegram via `/signals` (alias `/rules`).
 
 ## Telegram control surface
 
@@ -203,14 +309,31 @@ Every cycle prints a heartbeat block:
 
 ```
 ─── cycle 14 — 2026-05-24T11:36:00Z ───
-[universe ] tracking 12 instruments (base=10, llm=2)
-[market   ] fetched 12 rates, 12 candle sets in 410 ms
-[signals  ] 3 buy / 0 close candidates (NVDA, MSFT, BTC)
-[ai       ] decision: BUY NVDA 250 USD; HOLD others (latency 1.4 s)
-[risk     ] approved 1 / 1 — within all caps
-[exec     ] OPEN  NVDA  250.00 USD  long  SL=128.40 TP=143.10  → orderID 13902598
-[portfolio] equity=$10,251.83  available=$9,500.83  open=4
+[universe]  tracking 12 instrument(s): base=10, llm=2
+[market]    fetched 12/12 rate(s)
+[signals]   3 candidate(s): BUY NVDA(0.62), BUY MSFT(0.48), CLOSE TSLA(-0.31)
+[regime]    SPX500 trending up, BTC ranging
+[tools]     1 gated: AAPL(spread_filter)
+[ai]        decision (llm, 1432 ms): BUY NVDA 250 USD; HOLD others
+[risk]      approved 1 / 1 — all clear
+[exec]      OK         BUY    NVDA      — orderID 13902598
+[portfolio] equity=$10,251.83  available=$9,500.83  invested=$751.00  pnl=$+12.40  bot_owned=4
 ─────────────────────────────────────
 ```
 
-DEBUG level adds raw JSON envelopes per call.
+DEBUG level adds raw JSON envelopes per call. Per-cycle telemetry is
+also pushed to the in-memory snapshot store so `/status`,
+`/portfolio`, and `/universe` from Telegram return up-to-date state
+without re-hitting eToro.
+
+## Tests
+
+```bash
+. .venv/bin/activate
+python -m unittest discover -s tests -v
+```
+
+Currently 256 unit tests (no network or eToro/Azure access required —
+all external calls are stubbed). Per the project rule the test runner
+uses the in-tree `.venv`; if you don't have one, `pip install -r
+requirements.txt` into a fresh venv first.
