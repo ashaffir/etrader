@@ -1,0 +1,6 @@
+# eToro autonomous trading bot — runtime deps.
+# Tests use only the Python stdlib (`unittest`), so no test-only deps.
+# tomllib is used for config parsing (Python >= 3.11).
+
+requests>=2.31,<3            # HTTP client for the eToro Public API
+openai>=1.40,<2              # Azure OpenAI / Foundry chat completions client

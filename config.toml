@@ -1,0 +1,164 @@
+# =====================================================================
+# etrader — autonomous trading-bot configuration
+# =====================================================================
+# All trading credentials live in `.env`; this file holds *behavior*
+# defaults: guardrails, operations, universe selection, AI tuning.
+# Every field has a safe default — you can delete sections you don't
+# want to change.
+
+# ---------------------------------------------------------------------
+# [mode] paper vs. live
+# ---------------------------------------------------------------------
+# - "paper" → uses the eToro **demo** environment (fake money, real
+#   prices). Always safe.
+# - "live"  → uses the eToro **real** environment. Requires
+#   `ALLOW_REAL=true` AND a populated `REAL_USER_KEY` in `.env`. The
+#   bot will refuse to start otherwise.
+[mode]
+trading = "paper"
+
+# ---------------------------------------------------------------------
+# [guardrails] hard limits applied before every trade
+# ---------------------------------------------------------------------
+[guardrails]
+max_per_trade_usd          = 500.0   # max cash committed per single open
+max_parallel_trades        = 10      # max simultaneous open positions opened by this bot
+daily_loss_stop_usd        = 250.0   # halt new opens for the day if equity drops by ≥ this vs. session start
+per_instrument_cooldown_min = 60     # after closing/opening on an instrument, ignore it for N minutes
+default_stop_loss_pct      = 5.0     # SL distance from entry (% of entry price)
+default_take_profit_pct    = 8.0     # TP distance from entry (% of entry price)
+max_leverage               = 1       # default leverage; the bot never sends > 1 unless this is raised
+
+# ---------------------------------------------------------------------
+# [operations] cycle timing + market-data shape
+# ---------------------------------------------------------------------
+[operations]
+check_interval_seconds   = 60        # how often the main loop runs
+universe_refresh_minutes = 30        # rebuild tracked-symbol set every N minutes
+candle_interval          = "OneHour" # OneMinute | FiveMinutes | FifteenMinutes | OneHour | FourHours | OneDay
+candle_count             = 100       # candles per instrument fetched per cycle (max 1000)
+request_timeout_seconds  = 20
+trade_spacing_seconds    = 3         # min spacing between trade-execution calls (eToro caps at 20 req/min)
+
+# ---------------------------------------------------------------------
+# [universe] which instruments to track
+# ---------------------------------------------------------------------
+# `base_symbols` are *always* tracked. `enable_llm_rotation` lets the
+# LLM nominate up to (max_tracked - len(base_symbols)) extra tickers
+# per refresh interval. Symbols are resolved to instrument IDs once
+# and cached in `data/instrument_cache.json`.
+[universe]
+base_symbols = [
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN",
+    "TSLA", "META",
+    "BTC", "ETH",
+    "SPX500"
+]
+max_tracked          = 25
+enable_llm_rotation  = true
+
+# ---------------------------------------------------------------------
+# [strategy] price-tool ensemble (entry / exit candidacy)
+# ---------------------------------------------------------------------
+# Every enabled price tool emits a signed score in [-1, +1]; the
+# weighted average across all of them is the ensemble's raw_score.
+#   raw_score >= min_signal_strength   → BUY candidate (unowned)
+#   raw_score <= -min_exit_strength    → CLOSE candidate (bot-owned)
+# Set any weight to 0.0 to disable that tool's contribution to
+# candidacy without removing it from the downstream tool catalog.
+[strategy]
+sma_short_period      = 10
+sma_long_period       = 30
+ema_fast_period       = 12
+ema_slow_period       = 26
+rsi_period            = 14
+rsi_oversold          = 30.0
+rsi_overbought        = 70.0
+macd_fast             = 12
+macd_slow             = 26
+macd_signal           = 9
+bollinger_period      = 20
+bollinger_stddev      = 2.0
+donchian_period       = 20
+momentum_lookback     = 10
+min_signal_strength   = 0.40     # min positive ensemble for BUY (calibrated)
+min_exit_strength     = 0.25     # min negative ensemble for CLOSE (lower bar — exit fast)
+weight_sma_cross      = 1.0
+weight_ema_cross      = 0.8
+weight_rsi            = 0.6
+weight_macd           = 1.0
+weight_bollinger      = 0.7
+weight_donchian       = 0.9
+weight_momentum       = 0.7
+
+# ---------------------------------------------------------------------
+# [tools] extended signal catalog + selector tuning
+# ---------------------------------------------------------------------
+# The bot ships with ~18 named tools (price/volume/context). The
+# selector picks a relevant subset per (instrument, cycle) using:
+#   1. asset-class compatibility (e.g. FX skips volume tools);
+#   2. live regime detection (trending vs ranging) per instrument;
+#   3. rolling per-tool hit-rate persisted to `performance_log_path`.
+[tools]
+enabled                 = true
+max_tools_per_cycle     = 14    # selector budget per (instrument, cycle)
+min_hit_rate            = 0.40  # demote a tool when rolling hit-rate dips below this
+min_observations        = 30    # minimum samples before perf demotion kicks in
+feed_enabled            = true
+feed_take               = 20    # number of feed posts to fetch per instrument
+feed_cache_ttl_seconds  = 600   # cache feed responses for 10 min
+regime_anchors          = ["SPX500", "BTC"]
+higher_tf_interval      = "OneDay"
+higher_tf_count         = 120
+performance_log_path    = "data/tool_performance.jsonl"
+spread_max_pct          = 0.5   # spread_filter gate caps BUYs above this %
+
+# ---------------------------------------------------------------------
+# [ai] Azure Foundry / OpenAI behaviour
+# ---------------------------------------------------------------------
+# Reads endpoint/key/deployment from .env. Toggle `enabled = false`
+# to fall back to deterministic-only signals.
+[ai]
+enabled                  = true
+max_completion_tokens    = 4000
+veto_on_unavailable      = true      # if AI call fails, skip placing new trades this cycle
+decision_lookback_candles = 30
+
+# ---------------------------------------------------------------------
+# [logging] output formatting
+# ---------------------------------------------------------------------
+[logging]
+level         = "INFO"               # DEBUG | INFO | WARNING | ERROR
+file          = "logs/trader.log"
+max_bytes     = 10485760             # 10 MB
+backup_count  = 5
+color_stdout  = true
+
+# ---------------------------------------------------------------------
+# [control] internal HTTP control API for the Telegram service
+# ---------------------------------------------------------------------
+# When `enabled = true` the trading bot starts a tiny HTTP server on
+# `host:port` that the Telegram service (or any trusted in-network
+# caller) uses to read status, request /pause /resume /panic, edit
+# guardrails, and forward free-text questions to the LLM. Auth is the
+# `INTERNAL_API_TOKEN` env var (Bearer token); requests without it are
+# rejected. Bind to 127.0.0.1 unless you run the Telegram service on a
+# different host on a private network.
+[control]
+enabled = true
+host    = "127.0.0.1"
+port    = 8770
+
+# ---------------------------------------------------------------------
+# [alerting] Telegram push-style alerts
+# ---------------------------------------------------------------------
+# Per-chat alert toggles for trade outcomes, kill-switch fires, AI
+# availability flips, etc. Allowed chats are taken from
+# `TELEGRAM_ALLOWED_CHAT_IDS` (.env), so the trading bot and Telegram
+# service share one allow-list. Use `/alerts` from Telegram to toggle.
+# Subscriptions persist to `data/alert_subscriptions.json`. New chats
+# default to safety-only alerts (panic_close, daily_loss_halt,
+# cycle_error, trade_failed); opt in to the trade-by-trade ones.
+[alerting]
+max_queue_per_chat   = 200                              # cap pending alerts per chat (oldest dropped beyond this)
+subscriptions_file   = "data/alert_subscriptions.json"

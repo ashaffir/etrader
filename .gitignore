@@ -1,0 +1,115 @@
+# =====================================================================
+# etrader — git ignore rules
+# =====================================================================
+# Anything generated, sensitive, or local-machine-specific is ignored.
+# `data/` and `logs/` are kept as empty directories via .gitkeep so the
+# bot can write to them on first run without the operator having to
+# remember to mkdir them.
+
+# ---------------------------------------------------------------------
+# Secrets & local config
+# ---------------------------------------------------------------------
+# The .env holds eToro API keys, Azure OpenAI key, Telegram bot token
+# and the internal API token. NEVER commit it.
+.env
+.env.*
+!.env.example          # safe to commit a redacted template
+
+# ---------------------------------------------------------------------
+# Bot runtime state (regenerated on the fly; may contain position info)
+# ---------------------------------------------------------------------
+# Keep the directory but ignore everything inside it.
+data/*
+!data/.gitkeep
+
+# Same idea for the rotating log file.
+logs/*
+!logs/.gitkeep
+
+# ---------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Distribution / packaging
+build/
+dist/
+*.egg
+*.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+
+# Type-checker / linter / test caches
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+.pytest_cache/
+.tox/
+.nox/
+.hypothesis/
+
+# Coverage reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+nosetests.xml
+*.cover
+*.lcov
+
+# Jupyter / IPython (not used today, but cheap to pre-empt)
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# ---------------------------------------------------------------------
+# Editors / IDEs
+# ---------------------------------------------------------------------
+.idea/
+*.iml
+.vscode/
+!.vscode/settings.json.example
+
+# Vim / Emacs swap files
+*.swp
+*.swo
+*~
+.#*
+\#*\#
+
+# ---------------------------------------------------------------------
+# OS metadata
+# ---------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# ---------------------------------------------------------------------
+# Project-specific
+# ---------------------------------------------------------------------
+# Anything dropped here by the agent / scratch experiments.
+scratch/
+tmp/
+*.bak
+*.tmp
+*.orig
