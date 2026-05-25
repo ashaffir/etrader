@@ -43,19 +43,87 @@ trade_spacing_seconds    = 3         # min spacing between trade-execution calls
 # ---------------------------------------------------------------------
 # [universe] which instruments to track
 # ---------------------------------------------------------------------
-# `base_symbols` are *always* tracked. `enable_llm_rotation` lets the
-# LLM nominate up to (max_tracked - len(base_symbols)) extra tickers
-# per refresh interval. Symbols are resolved to instrument IDs once
-# and cached in `data/instrument_cache.json`.
+# Phase 2: news-driven. The universe is built every
+# `operations.universe_refresh_minutes` from the news candidate store
+# (see [news] below). Each candidate is probed for trading activity
+# (volatility + spread) before being admitted to the tracked set.
+#
+# `base_symbols` is now empty by default — operators who want a
+# guaranteed-tracked seed list can fill this in, but seeds still pass
+# through the activity filter.
+#
+# `enable_llm_rotation` is kept as a *fallback* (used only when news
+# yields fewer than max_tracked passing candidates and the LLM is
+# configured). Symbols are resolved to instrument IDs once and
+# cached in `data/instrument_cache.json`.
 [universe]
-base_symbols = [
-    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN",
-    "TSLA", "META",
-    "BTC", "ETH",
-    "SPX500"
-]
-max_tracked          = 25
-enable_llm_rotation  = true
+base_symbols          = []
+max_tracked           = 25
+enable_llm_rotation   = true
+
+# Activity-filter knobs. A candidate is rejected from the tracked
+# universe when its ATR% is below `min_atr_pct` (too flat to trade)
+# or its eToro spread exceeds `max_spread_pct` (cost-to-trade too
+# high). `probe_max_candidates` caps how many news candidates the
+# builder will probe per refresh (top N by score).
+min_atr_pct           = 0.3
+max_spread_pct        = 1.0
+atr_period            = 14
+activity_min_candles  = 20
+probe_max_candidates  = 50
+
+# ---------------------------------------------------------------------
+# [news] news-driven universe discovery (phase 1)
+# ---------------------------------------------------------------------
+# The aggregator runs every `scan_interval_minutes` and folds new
+# observations into `data/news_candidates.json`. Each candidate ages
+# out after `ttl_hours` of no new mentions. `enabled_sources` selects
+# the plug-ins to activate:
+#
+#   - "stocktwits"  → trending tickers (no key, no rate limit)
+#   - "sec_edgar"   → 8-K material-event filings (US-listed)
+#   - "google_news" → broad RSS, rotating finance queries
+#   - "yahoo_rss"   → per-ticker headlines, enrichment for tracked symbols
+#   - "yfinance"    → per-ticker news + co-mentioned `relatedTickers`
+#
+# Per-source caps below keep API usage modest. Phase 2 wires the
+# universe builder to consume the candidate store; for phase 1 these
+# settings only affect the news pipeline itself.
+[news]
+enabled                          = true
+scan_interval_minutes            = 60
+ttl_hours                        = 24
+candidate_store_path             = "data/news_candidates.json"
+half_life_hours                  = 6.0
+enabled_sources                  = ["stocktwits", "sec_edgar", "google_news", "yahoo_rss", "yfinance"]
+google_news_max_items_per_query  = 25
+yahoo_rss_max_symbols            = 50
+yahoo_rss_max_items_per_symbol   = 10
+yfinance_max_symbols             = 50
+yfinance_max_items_per_symbol    = 10
+sec_edgar_cik_cache_path         = "data/sec_cik_to_ticker.json"
+
+# ---------------------------------------------------------------------
+# [fundamentals] yfinance-backed per-symbol valuation cache (phase 3)
+# ---------------------------------------------------------------------
+# On every universe refresh the bot tops up a small JSON cache with
+# fundamentals (sector, P/E, margins, growth, analyst targets, ...)
+# for the tracked tickers. Entries are re-fetched after
+# `refresh_after_hours` or as soon as their recorded next-earnings
+# timestamp passes. `budget_per_refresh` caps how many *stale* tickers
+# we'll re-fetch in a single cycle so a 50-ticker universe doesn't
+# block the loop on 50 sequential yfinance calls.
+#
+# `enrich_decision_prompt = true` appends a trim fundamentals dict
+# to each candidate in the LLM decision prompt; switch to false to
+# keep the cache populated without paying the token cost.
+[fundamentals]
+enabled                  = true
+cache_path               = "data/fundamentals_cache.json"
+refresh_after_hours      = 24.0
+failure_backoff_hours    = 6.0
+budget_per_refresh       = 8
+enrich_decision_prompt   = true
 
 # ---------------------------------------------------------------------
 # [strategy] price-tool ensemble (entry / exit candidacy)

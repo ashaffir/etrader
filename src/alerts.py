@@ -43,6 +43,12 @@ class AlertType(str, Enum):
     CYCLE_ERROR = "cycle_error"
     AI_UNAVAILABLE = "ai_unavailable"
     UNIVERSE_CHANGED = "universe_changed"
+    # Emitted when the universe refresh produced rejections — i.e. a
+    # candidate the news pipeline flagged was filtered out by the
+    # activity gate (low ATR, wide spread, ...). Helps operators tune
+    # `[universe] min_atr_pct` / `max_spread_pct` and notice when a
+    # promising news story isn't tradeable on eToro.
+    UNIVERSE_REJECTED = "universe_rejected"
     BOT_PAUSED_RESUMED = "bot_paused_resumed"
 
     @classmethod

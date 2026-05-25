@@ -59,6 +59,7 @@ class DecisionEngine:
         tool_results: Mapping[int, ToolRunResult] | None = None,
         cross_asset_regime: Mapping[str, Any] | None = None,
         strategy_rules: Mapping[str, Any] | None = None,
+        fundamentals_by_symbol: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> DecisionResult:
         if not candidates:
             return DecisionResult(requests=[], summary="no candidates", llm_used=False, latency_ms=None, raw_text=None)
@@ -76,6 +77,7 @@ class DecisionEngine:
                     tool_results=tool_results,
                     cross_asset_regime=cross_asset_regime,
                     strategy_rules=strategy_rules,
+                    fundamentals_by_symbol=fundamentals_by_symbol or {},
                 )
                 requests = self._requests_from_llm(ai_result.parsed_json, candidates, bot_owned_positions)
                 return DecisionResult(
@@ -118,6 +120,7 @@ class DecisionEngine:
         tool_results: Mapping[int, ToolRunResult],
         cross_asset_regime: Mapping[str, Any] | None,
         strategy_rules: Mapping[str, Any] | None,
+        fundamentals_by_symbol: Mapping[str, Mapping[str, Any]],
     ) -> AiCallResult:
         assert self._ai_client is not None
         owned = [
@@ -133,7 +136,11 @@ class DecisionEngine:
             for p in bot_owned_positions
         ]
         cands = [
-            self._candidate_to_dict(c, tool_results.get(c.instrument_id))
+            self._candidate_to_dict(
+                c,
+                tool_results.get(c.instrument_id),
+                fundamentals=fundamentals_by_symbol.get(c.symbol.upper()),
+            )
             for c in candidates
         ]
         guardrails_summary = {
@@ -243,6 +250,8 @@ class DecisionEngine:
     def _candidate_to_dict(
         c: Candidate,
         tool_result: ToolRunResult | None,
+        *,
+        fundamentals: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         out: dict[str, Any] = {
             "instrumentId": c.instrument_id,
@@ -270,6 +279,12 @@ class DecisionEngine:
                 "gate_passed": tool_result.gate_passed,
                 "gate_reason": tool_result.gate_reason,
             }
+        if fundamentals:
+            # Per-candidate fundamentals payload (sector, P/E, growth,
+            # analyst target, ...). The LLM is told in the system
+            # prompt to use these for context — they do NOT override
+            # the technical candidacy gate.
+            out["fundamentals"] = dict(fundamentals)
         return out
 
     @staticmethod

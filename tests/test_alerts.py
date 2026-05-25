@@ -28,7 +28,8 @@ class AlertTypeTests(unittest.TestCase):
         self.assertIn("universe_changed", names)
         self.assertIn("bot_paused_resumed", names)
         self.assertIn("trade_failed", names)
-        self.assertEqual(len(names), 9)
+        self.assertIn("universe_rejected", names)
+        self.assertEqual(len(names), 10)
         self.assertNotIn("cycle_heartbeat", names)
 
     def test_safety_only_default_subset(self) -> None:
@@ -43,6 +44,12 @@ class AlertTypeTests(unittest.TestCase):
     def test_from_value_unknown_returns_none(self) -> None:
         self.assertIsNone(AlertType.from_value("nope"))
         self.assertEqual(AlertType.from_value("trade_opened"), AlertType.TRADE_OPENED)
+
+    def test_universe_rejected_is_opt_in(self) -> None:
+        # ``universe_rejected`` is intentionally NOT in the safety-only
+        # default because it can be chatty when the activity filter is
+        # tuned tight. Operators opt in via /alerts.
+        self.assertNotIn(AlertType.UNIVERSE_REJECTED, safety_only_default())
 
 
 class AlertSubscriptionsTests(unittest.TestCase):

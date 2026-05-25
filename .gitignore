@@ -103,6 +103,7 @@ ipython_config.py
 ehthumbs.db
 Thumbs.db
 Desktop.ini
+.*.pid
 
 # ---------------------------------------------------------------------
 # Project-specific

@@ -13,8 +13,10 @@ to) and restores persisted bot state if a previous process saved it.
 
 from __future__ import annotations
 
+import os
 import signal
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -31,9 +33,14 @@ from .etoro.identity import fetch_identity
 from .etoro.instrument_cache import InstrumentCache
 from .execution.executor import TradeExecutor
 from .execution.monitor import PositionMonitor
+from .fundamentals import FundamentalsCache, build_fundamentals_cache
 from .logging_setup import configure_logging, get_logger
+from .news.candidate_store import CandidateStore
+from .news.factory import build_news_pipeline
+from .news.scheduler import NewsScheduler
 from .persistence import StatePersistence
 from .state import BotState
+from .strategy.activity_filter import ActivityFilter
 from .strategy.decisions import DecisionEngine
 from .strategy.risk import RiskEvaluator
 from .strategy.tool_orchestration import ToolOrchestrator
@@ -55,6 +62,12 @@ class TradingBot:
         configure_logging(cfg.logging, project_root)
         self.log = get_logger("main", tag="main")
         self._stop = False
+        # Threading event mirrors `self._stop` so subsystems running in
+        # blocking code (cycle runner, universe probe, news scan) can
+        # poll a single source of truth and bail out early instead of
+        # finishing every step after a Ctrl-C.
+        self._stop_event = threading.Event()
+        self._signal_count = 0
 
         self._config_store = config_store
         self.state = BotState()
@@ -94,15 +107,50 @@ class TradingBot:
         self._tool_orchestrator = self._build_tool_orchestrator()
         if self._tool_orchestrator is not None:
             self.controller.set_tool_orchestrator(self._tool_orchestrator)
+        self._news_store, self._news_scheduler = self._build_news_pipeline()
+        if self._news_store is not None:
+            self.controller.set_news_store(self._news_store, self._news_scheduler)
+        self._fundamentals = self._build_fundamentals_cache()
+        if self._fundamentals is not None:
+            self.controller.set_fundamentals(self._fundamentals)
         self._control_server = self._maybe_start_control_server()
         self._runner = self._build_runner()
 
     # ------------------------------------------------------------------
 
     def stop(self, *_: object) -> None:
-        if not self._stop:
-            self.log.info("shutdown signal received — stopping after current cycle")
-        self._stop = True
+        """Signal handler. First press → graceful; second → hard exit.
+
+        With Phase 2 a single cycle includes several synchronous HTTP
+        calls (universe probe + LLM decision) that can run for tens of
+        seconds. Operators expect Ctrl-C to mean "I'm done waiting" the
+        first time, and "no, really, exit now" the second time.
+        """
+        self._signal_count += 1
+        if self._signal_count == 1:
+            self.log.info(
+                "shutdown signal received — stopping after current step "
+                "(press Ctrl-C again to force exit)",
+            )
+            self._stop = True
+            self._stop_event.set()
+            return
+        # Second signal: restore the default handler so a *third* Ctrl-C
+        # gives the operator their normal escape hatch, then trigger an
+        # immediate exit. We can't raise KeyboardInterrupt cleanly from
+        # here because we're already inside a signal frame; os._exit
+        # skips finalizers but that's the right call when the user has
+        # asked twice.
+        self.log.warning(
+            "second shutdown signal — forcing immediate exit (130)",
+        )
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        except (ValueError, OSError):
+            # Restoring defaults is best-effort; we're exiting anyway.
+            pass
+        os._exit(130)
 
     def run(self) -> int:
         signal.signal(signal.SIGINT, self.stop)
@@ -165,12 +213,17 @@ class TradingBot:
             ai_client=self._ai_client,
             logger=get_logger("strategy.decisions", tag="ai"),
         )
+        activity_filter = ActivityFilter(self.cfg.universe)
         universe_builder = UniverseBuilder(
             self.cfg.universe,
+            self.cfg.operations,
             cache=self.cache,
+            candidate_store=self._news_store,
+            activity_filter=activity_filter,
             ai_client=self._ai_client,
             etoro_client=self._etoro,
             logger=get_logger("strategy.universe", tag="universe"),
+            is_stopping=self._stop_event.is_set,
         )
         return CycleRunner(
             self.cfg,
@@ -186,8 +239,54 @@ class TradingBot:
             history=self.history,
             tool_orchestrator=self._tool_orchestrator,
             alerts=self.alerts,
+            news_scheduler=self._news_scheduler,
+            fundamentals_cache=self._fundamentals,
+            stop_event=self._stop_event,
             log=get_logger("cycle", tag="cycle"),
         )
+
+    def _build_news_pipeline(self) -> tuple[CandidateStore | None, NewsScheduler | None]:
+        """Construct the news aggregator + scheduler (or short-circuit).
+
+        The pipeline is *always* constructed in Phase 2 because the
+        universe builder consumes the candidate store. Disabling news
+        is done by clearing ``enabled_sources``, not by skipping the
+        pipeline entirely — that way the universe builder still has a
+        valid (empty) store to read.
+        """
+        store, _aggregator, scheduler = build_news_pipeline(
+            self.cfg.news,
+            project_root=self._project_root,
+            instrument_cache=self.cache,
+            logger=get_logger("news", tag="news"),
+        )
+        if not self.cfg.news.enabled:
+            self.log.info(
+                "[news] disabled in config — universe will only build from "
+                "previously persisted candidates and LLM rotation",
+            )
+        return store, scheduler
+
+    def _build_fundamentals_cache(self) -> FundamentalsCache | None:
+        """Wire the yfinance-backed fundamentals cache (Phase 3).
+
+        Returns ``None`` when ``[fundamentals] enabled = false`` so the
+        cycle and Telegram surfaces fall back to the Phase 2 behaviour
+        (universe + news only, no per-symbol fundamentals).
+        """
+        cache = build_fundamentals_cache(
+            self.cfg.fundamentals,
+            project_root=self._project_root,
+            logger=get_logger("fundamentals", tag="fund"),
+        )
+        if cache is None:
+            self.log.info("[fundamentals] disabled in config")
+            return None
+        self.log.info(
+            "[fundamentals] cache ready (%d entries at %s)",
+            len(cache), cache.path,
+        )
+        return cache
 
     def _build_alert_hub(self) -> AlertHub | None:
         """Build the alert fan-out hub if any chat IDs are allow-listed."""

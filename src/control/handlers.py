@@ -57,6 +57,23 @@ def _universe(c: BotController, _body, _q) -> tuple[int, Any]:
     return 200, c.snapshot_universe()
 
 
+def _news(c: BotController, _body, q: Mapping[str, str]) -> tuple[int, Any]:
+    raw = q.get("limit") or "25"
+    try:
+        limit = int(raw)
+    except ValueError:
+        limit = 25
+    return 200, c.snapshot_news(limit=limit)
+
+
+def _fundamentals(
+    c: BotController, _body, q: Mapping[str, str],
+) -> tuple[int, Any]:
+    """``GET /fundamentals[?symbol=AAPL]`` — list cached symbols or one detail."""
+    symbol = (q.get("symbol") or "").strip() or None
+    return 200, c.snapshot_fundamentals(symbol=symbol)
+
+
 def _history(c: BotController, _body, q: Mapping[str, str]) -> tuple[int, Any]:
     raw = q.get("limit") or "20"
     try:
@@ -108,6 +125,31 @@ def _ask(c: BotController, body: Mapping[str, Any] | None, _q) -> tuple[int, Any
 
 def _strategy_signals(c: BotController, _body, _q) -> tuple[int, Any]:
     return 200, c.snapshot_strategy_rules()
+
+
+def _news_channels(c: BotController, _body, _q) -> tuple[int, Any]:
+    """``GET /news/channels`` — per-source health overview."""
+    return 200, c.snapshot_news_channels()
+
+
+def _news_channels_test(
+    c: BotController, body: Mapping[str, Any] | None, q: Mapping[str, str],
+) -> tuple[int, Any]:
+    """``POST /news/channels/test`` — live dry-run against each source.
+
+    Optional body / query parameter ``only`` accepts a comma-separated
+    list (query) or list/string (body) of source names to probe. When
+    omitted, every wired source is probed.
+    """
+    only: list[str] | None = None
+    raw = (body or {}).get("only") if body else None
+    if raw is None:
+        raw = q.get("only")
+    if isinstance(raw, str):
+        only = [s for s in (p.strip() for p in raw.split(",")) if s]
+    elif isinstance(raw, (list, tuple)):
+        only = [str(s).strip() for s in raw if str(s).strip()]
+    return 200, c.test_news_channels(only=only)
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +229,8 @@ def build_route_table() -> RouteTable:
     rt.add("GET", "/status", _status)
     rt.add("GET", "/portfolio", _portfolio)
     rt.add("GET", "/universe", _universe)
+    rt.add("GET", "/news", _news)
+    rt.add("GET", "/fundamentals", _fundamentals)
     rt.add("GET", "/history", _history)
     rt.add("GET", "/config/guardrails", _config_get)
     rt.add("POST", "/config/guardrails", _config_set)
@@ -196,6 +240,8 @@ def build_route_table() -> RouteTable:
     rt.add("POST", "/ask", _ask)
     rt.add("POST", "/shutdown", _shutdown)
     rt.add("GET", "/strategy/signals", _strategy_signals)
+    rt.add("GET", "/news/channels", _news_channels)
+    rt.add("POST", "/news/channels/test", _news_channels_test)
     rt.add("GET", "/alerts/types", _alerts_types)
     rt.add("GET", "/alerts/subscriptions", _alerts_subscriptions_get)
     rt.add("POST", "/alerts/subscriptions", _alerts_subscriptions_set)

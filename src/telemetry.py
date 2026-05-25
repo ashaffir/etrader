@@ -35,6 +35,9 @@ class _Mutable:
     tracked_instrument_ids: list[int] = field(default_factory=list)
     base_count: int = 0
     llm_count: int = 0
+    universe_reasons: dict[str, str] = field(default_factory=dict)  # symbol → reason
+    universe_source_counts: dict[str, int] = field(default_factory=dict)
+    universe_rejected: dict[str, str] = field(default_factory=dict)
 
     last_decision_summary: str | None = None
     last_decision_llm_used: bool = False
@@ -84,12 +87,18 @@ class TelemetryStore:
         symbols: list[str],
         base_count: int,
         llm_count: int,
+        reasons: Mapping[str, str] | None = None,
+        source_counts: Mapping[str, int] | None = None,
+        rejected: Mapping[str, str] | None = None,
     ) -> None:
         with self._lock:
             self._data.tracked_instrument_ids = list(instrument_ids)
             self._data.tracked_symbols = list(symbols)
             self._data.base_count = int(base_count)
             self._data.llm_count = int(llm_count)
+            self._data.universe_reasons = dict(reasons or {})
+            self._data.universe_source_counts = dict(source_counts or {})
+            self._data.universe_rejected = dict(rejected or {})
 
     def update_decision(
         self,
@@ -120,6 +129,9 @@ class TelemetryStore:
                 "tracked_instrument_ids": list(d.tracked_instrument_ids),
                 "base_count": d.base_count,
                 "llm_count": d.llm_count,
+                "universe_reasons": dict(d.universe_reasons),
+                "universe_source_counts": dict(d.universe_source_counts),
+                "universe_rejected": dict(d.universe_rejected),
                 "last_decision_summary": d.last_decision_summary,
                 "last_decision_llm_used": d.last_decision_llm_used,
                 "last_decision_actions": [dict(a) for a in d.last_decision_actions],

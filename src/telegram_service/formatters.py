@@ -69,17 +69,229 @@ def format_portfolio(portfolio: Mapping[str, Any]) -> str:
 
 def format_universe(universe: Mapping[str, Any]) -> str:
     symbols = list(universe.get("symbols") or [])
-    base_count = int(universe.get("base_count") or 0)
-    llm_count = int(universe.get("llm_count") or 0)
+    source_counts = universe.get("source_counts") or {}
+    reasons = universe.get("reasons") or {}
+    rejected = universe.get("rejected") or {}
     if not symbols:
-        return "[UNIVERSE]\n(no instruments tracked yet — wait for the first cycle)"
+        body = "[UNIVERSE]\n(no instruments tracked — the news scan returned no candidates that passed the activity filter)"
+        if rejected:
+            body += "\n\nRecent rejections:\n"
+            body += "\n".join(f"  {sym}: {reason}" for sym, reason in list(rejected.items())[:10])
+        return body
+    src_summary = ", ".join(f"{k}={v}" for k, v in source_counts.items()) or "(no breakdown)"
     lines = [
         "[UNIVERSE]",
-        f"tracking {len(symbols)} instrument(s) (base={base_count}, llm={llm_count})",
+        f"tracking {len(symbols)} instrument(s) — {src_summary}",
         "",
-        ", ".join(symbols),
     ]
+    for sym in symbols:
+        reason = reasons.get(sym) or "(no reason recorded)"
+        lines.append(f"  {sym}: {reason}")
+    if rejected:
+        lines.append("")
+        lines.append(f"Rejected this refresh ({len(rejected)}):")
+        for sym, reason in list(rejected.items())[:10]:
+            lines.append(f"  {sym}: {reason}")
+        if len(rejected) > 10:
+            lines.append(f"  … and {len(rejected) - 10} more")
     return "\n".join(lines)
+
+
+def format_news(news: Mapping[str, Any]) -> str:
+    """Render the /news payload returned by ``BotController.snapshot_news``."""
+    candidates = list(news.get("candidates") or [])
+    last_scan = news.get("last_scan")
+    next_scan_in_s = news.get("next_scan_in_seconds")
+
+    lines = ["[NEWS]"]
+    if last_scan:
+        finished = _fmt_unix(last_scan.get("finished_at_unix"))
+        per_src = last_scan.get("per_source_counts") or {}
+        src_summary = ", ".join(f"{k}={v}" for k, v in per_src.items()) or "(no sources)"
+        lines.append(
+            f"last scan: {finished} — kept {last_scan.get('items_kept', 0)}, "
+            f"obs {last_scan.get('observations_recorded', 0)}, {src_summary}"
+        )
+        errs = last_scan.get("per_source_errors") or {}
+        if errs:
+            err_str = ", ".join(f"{k}: {v[:30]}" for k, v in errs.items())
+            lines.append(f"errors: {err_str}")
+    else:
+        lines.append("last scan: (none yet)")
+    if next_scan_in_s is not None:
+        mins = max(0, int(float(next_scan_in_s) / 60))
+        lines.append(f"next scan in: ~{mins} min")
+    lines.append("")
+    if not candidates:
+        lines.append("(candidate store empty)")
+        return "\n".join(lines)
+    lines.append(f"top {len(candidates)} candidates:")
+    for c in candidates:
+        sym = c.get("symbol", "?")
+        score = float(c.get("score") or 0.0)
+        sources = "+".join(c.get("sources") or [])
+        head = (c.get("headlines") or [None])[0] or ""
+        lines.append(f"  {sym:<8}  score={score:5.2f}  [{sources}]  {head[:70]}")
+    return "\n".join(lines)
+
+
+def format_fundamentals(payload: Mapping[str, Any]) -> str:
+    """Render the /fundamentals control-API payload.
+
+    Two shapes:
+
+    - ``payload["symbol"]`` set → single-symbol detail view. Falls back
+      to a "not cached" message when ``snapshot is None``.
+    - No symbol → summary list of every cached entry, grouped by sector.
+    """
+    if not payload.get("enabled", True):
+        return (
+            "[FUNDAMENTALS]\n"
+            "Fundamentals cache is disabled in config "
+            "(set `[fundamentals] enabled = true` and restart)."
+        )
+    if payload.get("symbol"):
+        return _format_fundamentals_detail(payload)
+    return _format_fundamentals_list(payload)
+
+
+def _format_fundamentals_list(payload: Mapping[str, Any]) -> str:
+    items = list(payload.get("items") or [])
+    if not items:
+        return "[FUNDAMENTALS]\n(cache empty — wait for the next universe refresh)"
+    lines = [f"[FUNDAMENTALS]  ({payload.get('count', len(items))} cached)"]
+    by_sector: dict[str, list[Mapping[str, Any]]] = {}
+    for it in items:
+        sector = it.get("sector") or "(no sector)"
+        by_sector.setdefault(sector, []).append(it)
+    for sector in sorted(by_sector.keys()):
+        lines.append("")
+        lines.append(f"{sector}:")
+        for it in sorted(by_sector[sector], key=lambda i: i.get("symbol") or ""):
+            sym = (it.get("symbol") or "?").ljust(8)
+            name = (it.get("name") or "")[:30]
+            age_h = _hours_since(it.get("fetched_at_unix"))
+            lines.append(f"  {sym}  {name:<30}  age={age_h}")
+    lines.append("")
+    lines.append("Use `/fundamentals <SYMBOL>` for full detail.")
+    return "\n".join(lines)
+
+
+def _format_fundamentals_detail(payload: Mapping[str, Any]) -> str:
+    sym = payload.get("symbol") or "?"
+    snap = payload.get("snapshot")
+    if not snap:
+        return (
+            f"[FUNDAMENTALS] {sym}\n"
+            "(not cached — try again after the next universe refresh)"
+        )
+    name = snap.get("name") or sym
+    sector = snap.get("sector") or "(no sector)"
+    industry = snap.get("industry") or "(no industry)"
+    quote_type = snap.get("quote_type") or "?"
+    currency = snap.get("currency") or ""
+    age_h = _hours_since(snap.get("fetched_at_unix"))
+    lines = [
+        f"[FUNDAMENTALS] {sym}  —  {name}",
+        f"type={quote_type}  sector={sector} / {industry}  currency={currency}  age={age_h}",
+        "",
+        "Valuation:",
+        f"  market_cap:        {_compact_money(snap.get('market_cap'))}",
+        f"  enterprise_value:  {_compact_money(snap.get('enterprise_value'))}",
+        f"  P/E (trailing):    {_fmt_ratio(snap.get('trailing_pe'))}",
+        f"  P/E (forward):     {_fmt_ratio(snap.get('forward_pe'))}",
+        f"  P/B:               {_fmt_ratio(snap.get('price_to_book'))}",
+        f"  P/S:               {_fmt_ratio(snap.get('price_to_sales'))}",
+        f"  dividend yield:    {_fmt_pct(snap.get('dividend_yield'))}",
+        f"  beta:              {_fmt_ratio(snap.get('beta'))}",
+        "",
+        "Profitability / growth:",
+        f"  profit margin:     {_fmt_pct(snap.get('profit_margin'))}",
+        f"  operating margin:  {_fmt_pct(snap.get('operating_margin'))}",
+        f"  ROE:               {_fmt_pct(snap.get('return_on_equity'))}",
+        f"  revenue growth:    {_fmt_pct(snap.get('revenue_growth'))}",
+        f"  earnings growth:   {_fmt_pct(snap.get('earnings_growth'))}",
+        f"  debt/equity:       {_fmt_ratio(snap.get('debt_to_equity'))}",
+        "",
+        "52-week range:",
+        f"  high:              {_compact_money(snap.get('fifty_two_week_high'))}",
+        f"  low:               {_compact_money(snap.get('fifty_two_week_low'))}",
+    ]
+    target = snap.get("analyst_target_mean")
+    rec = snap.get("analyst_recommendation")
+    count = snap.get("analyst_count")
+    if target or rec or count:
+        lines.append("")
+        lines.append("Analyst consensus:")
+        lines.append(f"  recommendation:    {rec or '—'}")
+        lines.append(f"  target (mean):     {_compact_money(target)}")
+        lines.append(f"  # analysts:        {count if count is not None else '—'}")
+    next_e = snap.get("next_earnings_unix")
+    if next_e:
+        lines.append("")
+        lines.append(f"Next earnings: {_fmt_unix(next_e)}")
+    summary_text = snap.get("summary")
+    if summary_text:
+        lines.append("")
+        lines.append(str(summary_text))
+    return "\n".join(lines)
+
+
+def _hours_since(ts: Any) -> str:
+    if ts is None:
+        return "—"
+    try:
+        delta = max(0.0, datetime.now(timezone.utc).timestamp() - float(ts))
+    except (TypeError, ValueError):
+        return "—"
+    if delta < 3600:
+        return f"{int(delta / 60)}m"
+    return f"{delta / 3600:.1f}h"
+
+
+def _compact_money(v: Any) -> str:
+    if v is None:
+        return "—"
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    sign = "-" if n < 0 else ""
+    a = abs(n)
+    if a >= 1e12:
+        return f"{sign}{a / 1e12:.2f}T"
+    if a >= 1e9:
+        return f"{sign}{a / 1e9:.2f}B"
+    if a >= 1e6:
+        return f"{sign}{a / 1e6:.2f}M"
+    if a >= 1e3:
+        return f"{sign}{a / 1e3:.2f}K"
+    return f"{sign}{a:.2f}"
+
+
+def _fmt_ratio(v: Any) -> str:
+    if v is None:
+        return "—"
+    try:
+        return f"{float(v):.2f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _fmt_pct(v: Any) -> str:
+    if v is None:
+        return "—"
+    try:
+        # yfinance returns ratios as fractions for margins/growth (0.27 = 27%),
+        # but dividend_yield is already a percentage in newer versions. We
+        # render the fractional shape with a small heuristic: ratios < 5
+        # are treated as fractions, larger values as already-percentages.
+        n = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if abs(n) < 5:
+        n *= 100.0
+    return f"{n:+.2f}%"
 
 
 def format_history(entries: Sequence[Mapping[str, Any]]) -> str:
@@ -134,7 +346,10 @@ def format_help() -> str:
         "Commands:\n"
         "  /status            current bot state\n"
         "  /portfolio         positions + equity / available / P&L\n"
-        "  /universe          instruments currently tracked\n"
+        "  /universe          instruments currently tracked (with reasons)\n"
+        "  /news [N]          top-N news candidates + last scan stats\n"
+        "  /channels [sub]    news-source health (sub: test [names] | logs)\n"
+        "  /fundamentals [SYM] cached fundamentals (list or one symbol)\n"
         "  /signals           explain the live entry/exit rules + tools\n"
         "  /history [N]       last N trade-execution outcomes (default 20)\n"
         "  /guardrails        show current guardrails\n"

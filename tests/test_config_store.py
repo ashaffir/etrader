@@ -130,6 +130,54 @@ class SnapshotTests(unittest.TestCase):
         self.assertIsNotNone(self.store.get_meta("first_snapshot_unix"))
 
 
+class MissingSectionMigrationTests(unittest.TestCase):
+    """``add_missing_sections`` backfills late-added sections only."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = Path(self._tmp.name) / "config.sqlite"
+        self.store = ConfigStore(self.db_path)
+        self.addCleanup(self.store.close)
+
+    def test_backfills_only_missing_sections(self) -> None:
+        # First-run snapshot only writes the legacy sections.
+        self.store.snapshot_if_empty({
+            "guardrails": {"max_per_trade_usd": 500.0},
+            "strategy": {"min_signal_strength": 0.4},
+        })
+        # Operator edits one legacy field.
+        self.store.set_field("guardrails", "max_per_trade_usd", 123.0)
+
+        # Second-run "migration" introduces fundamentals + keeps legacy.
+        added = self.store.add_missing_sections({
+            "guardrails": {"max_per_trade_usd": 999.0},  # already present → no-op
+            "strategy": {"min_signal_strength": 0.6},     # already present → no-op
+            "fundamentals": {"enabled": True, "budget_per_refresh": 8},
+        })
+        self.assertEqual(added, ["fundamentals"])
+        # Existing edit is preserved …
+        self.assertEqual(self.store.get_section("guardrails")["max_per_trade_usd"], 123.0)
+        # … and the new section is now populated.
+        self.assertEqual(
+            self.store.get_section("fundamentals"),
+            {"enabled": True, "budget_per_refresh": 8},
+        )
+
+    def test_idempotent_second_call(self) -> None:
+        self.store.snapshot_if_empty({"guardrails": {"x": 1}})
+        first = self.store.add_missing_sections({"fundamentals": {"enabled": True}})
+        second = self.store.add_missing_sections({"fundamentals": {"enabled": False}})
+        self.assertEqual(first, ["fundamentals"])
+        self.assertEqual(second, [])
+        self.assertTrue(self.store.get_section("fundamentals")["enabled"])
+
+    def test_records_migration_meta(self) -> None:
+        self.store.snapshot_if_empty({"guardrails": {"x": 1}})
+        self.store.add_missing_sections({"fundamentals": {"enabled": True}})
+        self.assertIsNotNone(self.store.get_meta("last_migration_unix"))
+
+
 class PersistenceAcrossReopenTests(unittest.TestCase):
     """The whole point of the DB: values survive store close/reopen."""
 

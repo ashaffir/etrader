@@ -95,9 +95,116 @@ class OperationsConfig:
 
 @dataclass(frozen=True)
 class UniverseConfig:
+    """Universe-selection configuration.
+
+    Phase 2 wires :class:`~src.strategy.universe.UniverseBuilder` to
+    consume the news candidate store as the primary symbol source.
+    ``base_symbols`` is kept as an empty default for backward
+    compatibility — if non-empty, it is treated as a *seed* (still
+    subject to the activity filter); the user's stated preference is
+    for an empty list (no static tracking).
+
+    Activity-filter knobs gate symbols that don't have enough
+    tradeable activity. A candidate fails the filter when:
+
+    * ATR% over the last ``atr_period`` candles is below
+      ``min_atr_pct`` (price too flat to clear typical SL/TP), OR
+    * eToro spread (ask−bid)/mid exceeds ``max_spread_pct`` (cost-to-
+      trade swallows expected edge).
+
+    Both knobs default to conservative values; tighten them once you
+    have confidence in your data feeds.
+    """
+
     base_symbols: tuple[str, ...] = ()
     max_tracked: int = 25
     enable_llm_rotation: bool = True
+
+    # Activity filter
+    min_atr_pct: float = 0.3       # min volatility (ATR / price * 100)
+    max_spread_pct: float = 1.0    # max relative spread, %
+    atr_period: int = 14           # Wilder ATR window
+    activity_min_candles: int = 20 # minimum candles required to evaluate
+
+    # Probing budget for unfamiliar candidates. The universe builder
+    # only probes the top N news candidates so a flood of trending
+    # symbols never causes an API blow-up.
+    probe_max_candidates: int = 50
+
+
+@dataclass(frozen=True)
+class NewsConfig:
+    """News-driven universe-discovery configuration.
+
+    Phase 1 (current) wires up the news-pipeline package; the
+    ``UniverseBuilder`` does not yet consume the candidate store, so
+    these knobs only affect the news aggregator itself. Phase 2 will
+    wire ``UniverseBuilder`` to read ``data/news_candidates.json`` and
+    drop ``base_symbols`` as the universe source of truth.
+    """
+
+    enabled: bool = True
+    scan_interval_minutes: int = 60
+    ttl_hours: int = 24
+    candidate_store_path: str = "data/news_candidates.json"
+    half_life_hours: float = 6.0
+    enabled_sources: tuple[str, ...] = (
+        "stocktwits",
+        "sec_edgar",
+        "google_news",
+        "yahoo_rss",
+        "yfinance",
+    )
+
+    # Per-source caps. Defaults are conservative — bump if you have
+    # bandwidth and want broader discovery / enrichment coverage.
+    google_news_queries: tuple[str, ...] = ()  # empty → use built-in defaults
+    google_news_max_items_per_query: int = 25
+    yahoo_rss_max_symbols: int = 50
+    yahoo_rss_max_items_per_symbol: int = 10
+    yfinance_max_symbols: int = 50
+    yfinance_max_items_per_symbol: int = 10
+    sec_edgar_cik_cache_path: str = "data/sec_cik_to_ticker.json"
+
+
+@dataclass(frozen=True)
+class FundamentalsConfig:
+    """Per-symbol fundamentals cache (Phase 3).
+
+    Lives next to the news pipeline conceptually: news drives *which*
+    symbols enter the universe, fundamentals enrich them with the
+    structural valuation / growth / analyst picture so the LLM and the
+    operator can reason beyond pure price action.
+
+    Fields
+    ------
+    enabled:
+        Master switch. When False the bot behaves exactly like Phase 2
+        — universe + news only, no yfinance.info calls.
+    cache_path:
+        JSON document under ``data/``.
+    refresh_after_hours:
+        Entries older than this are re-fetched on the next universe
+        refresh. Defaults to 24 h — fundamentals change slowly.
+    failure_backoff_hours:
+        Per-symbol cool-down after a fetch error. Prevents the cycle
+        from hammering yfinance every minute on a 429.
+    budget_per_refresh:
+        Cap on how many *stale* symbols we'll re-fetch in one universe
+        refresh. yfinance is slow (~500 ms/symbol); 8 keeps refresh
+        latency below ~5 s for the common case.
+    enrich_decision_prompt:
+        When True, fundamentals are appended to candidate dicts in the
+        LLM decision prompt. Operators paying per token can turn this
+        off without disabling the cache.
+    """
+
+    enabled: bool = True
+    cache_path: str = "data/fundamentals_cache.json"
+    refresh_after_hours: float = 24.0
+    failure_backoff_hours: float = 6.0
+    budget_per_refresh: int = 8
+    enrich_decision_prompt: bool = True
 
 
 @dataclass(frozen=True)
@@ -272,6 +379,8 @@ class AppConfig:
     guardrails: GuardrailsConfig
     operations: OperationsConfig
     universe: UniverseConfig
+    news: NewsConfig
+    fundamentals: FundamentalsConfig
     strategy: StrategyConfig
     ai: AiConfig
     tools: ToolsConfig
@@ -296,7 +405,12 @@ class AppConfig:
 # Field names that should always be coerced from list → tuple before being
 # fed into a frozen dataclass (the dataclass declares them as tuples, but
 # TOML / JSON / SQLite all decode them as lists).
-_TUPLE_FIELDS = {"base_symbols", "regime_anchors"}
+_TUPLE_FIELDS = {
+    "base_symbols",
+    "regime_anchors",
+    "enabled_sources",
+    "google_news_queries",
+}
 
 
 def _coerce_field_values(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -405,6 +519,14 @@ def load_config(
         universe = _build_section(
             UniverseConfig, toml=raw.get("universe"), db=store.get_section("universe"),
         )
+        news = _build_section(
+            NewsConfig, toml=raw.get("news"), db=store.get_section("news"),
+        )
+        fundamentals = _build_section(
+            FundamentalsConfig,
+            toml=raw.get("fundamentals"),
+            db=store.get_section("fundamentals"),
+        )
         strategy = _build_section(
             StrategyConfig, toml=raw.get("strategy"), db=store.get_section("strategy"),
         )
@@ -419,15 +541,22 @@ def load_config(
         )
 
         if snapshot_on_first_run:
-            store.snapshot_if_empty({
-                "guardrails": _section_to_dict(guardrails),
-                "operations": _section_to_dict(operations),
-                "universe":   _section_to_dict(universe),
-                "strategy":   _section_to_dict(strategy),
-                "ai":         _section_to_dict(ai),
-                "tools":      _section_to_dict(tools),
-                "logging":    _section_to_dict(logging_cfg),
-            })
+            merged_sections = {
+                "guardrails":   _section_to_dict(guardrails),
+                "operations":   _section_to_dict(operations),
+                "universe":     _section_to_dict(universe),
+                "news":         _section_to_dict(news),
+                "fundamentals": _section_to_dict(fundamentals),
+                "strategy":     _section_to_dict(strategy),
+                "ai":           _section_to_dict(ai),
+                "tools":        _section_to_dict(tools),
+                "logging":      _section_to_dict(logging_cfg),
+            }
+            store.snapshot_if_empty(merged_sections)
+            # On second+ runs: pick up newly-added sections (e.g.
+            # ``[fundamentals]`` introduced in Phase 3) without
+            # forcing operators to delete ``data/config.sqlite``.
+            store.add_missing_sections(merged_sections)
     finally:
         if store_owned:
             store.close()
@@ -497,6 +626,8 @@ def load_config(
         guardrails=guardrails,
         operations=operations,
         universe=universe,
+        news=news,
+        fundamentals=fundamentals,
         strategy=strategy,
         ai=ai,
         tools=tools,
@@ -629,6 +760,8 @@ def summarize_config(cfg: AppConfig) -> str:
         f"daily_loss_stop=${cfg.guardrails.daily_loss_stop_usd:.0f}",
         f"check_every={cfg.operations.check_interval_seconds}s",
         f"universe_base={len(cfg.universe.base_symbols)}",
+        f"news={'on' if cfg.news.enabled else 'off'}",
+        f"fundamentals={'on' if cfg.fundamentals.enabled else 'off'}",
         f"ai_enabled={cfg.ai.enabled and cfg.azure.is_configured}",
     )
     return ", ".join(parts)

@@ -35,6 +35,7 @@ from ..config_store import ConfigStore
 from ..etoro.client import EtoroClient
 from ..etoro.errors import EtoroApiError
 from ..etoro.trading import close_position_by_market, fetch_portfolio
+from ..news.channel_probe import probe_many
 from ..persistence import StatePersistence
 from ..state import BotState
 from ..strategy.rules_summary import ToolDescription, build_rules_payload
@@ -96,6 +97,9 @@ class BotController:
         self._paused = False
         self._stop_requested = False
         self._tool_orchestrator: Any | None = None
+        self._news_store: Any | None = None
+        self._news_scheduler: Any | None = None
+        self._fundamentals: Any | None = None
 
     # ------------------------------------------------------------------
     # Lock + pause primitives the cycle loop uses
@@ -121,6 +125,17 @@ class BotController:
         """Wire in the live ToolOrchestrator so /signals can introspect it."""
         with self._lock:
             self._tool_orchestrator = orchestrator
+
+    def set_news_store(self, store: Any, scheduler: Any) -> None:
+        """Wire in the live news pipeline so /news can introspect it."""
+        with self._lock:
+            self._news_store = store
+            self._news_scheduler = scheduler
+
+    def set_fundamentals(self, cache: Any) -> None:
+        """Wire in the live fundamentals cache so /fundamentals can read it."""
+        with self._lock:
+            self._fundamentals = cache
 
     # ------------------------------------------------------------------
     # Pause / resume
@@ -427,6 +442,215 @@ class BotController:
             "symbols": list(d.get("tracked_symbols") or []),
             "base_count": int(d.get("base_count") or 0),
             "llm_count": int(d.get("llm_count") or 0),
+            "reasons": dict(d.get("universe_reasons") or {}),
+            "source_counts": dict(d.get("universe_source_counts") or {}),
+            "rejected": dict(d.get("universe_rejected") or {}),
+        }
+
+    def snapshot_fundamentals(self, *, symbol: str | None = None) -> dict[str, Any]:
+        """Return the cached fundamentals payload.
+
+        When ``symbol`` is supplied, returns ``{"symbol": SYM,
+        "snapshot": {...}}`` (or ``{"symbol": SYM, "snapshot": None}``
+        if we have nothing cached). When ``symbol`` is None, returns a
+        summary view ``{"count": N, "items": [{"symbol", "name",
+        "sector", "fetched_at_unix"}, ...]}`` so /fundamentals (with no
+        argument) can show what's currently cached.
+
+        Safe to call when the cache hasn't been wired: returns
+        ``{"enabled": false, ...}``.
+        """
+        if self._fundamentals is None:
+            return {"enabled": False, "symbol": symbol, "snapshot": None, "items": []}
+        if symbol:
+            sym = symbol.strip().upper()
+            snap = self._fundamentals.get(sym)
+            return {
+                "enabled": True,
+                "symbol": sym,
+                "snapshot": snap.to_dict() if snap is not None else None,
+            }
+        items: list[dict[str, Any]] = []
+        for s in self._fundamentals.all().values():
+            items.append({
+                "symbol": s.symbol,
+                "name": s.name,
+                "sector": s.sector,
+                "industry": s.industry,
+                "quote_type": s.quote_type,
+                "fetched_at_unix": s.fetched_at_unix,
+                "next_earnings_unix": s.next_earnings_unix,
+            })
+        items.sort(key=lambda i: i["symbol"])
+        return {"enabled": True, "count": len(items), "items": items}
+
+    def snapshot_news(self, *, limit: int = 25) -> dict[str, Any]:
+        """Return the top-N candidates from the news store plus the last scan stats.
+
+        Safe to call when the news pipeline hasn't been wired (returns
+        an empty payload). ``limit`` is clamped to [1, 200].
+        """
+        limit = max(1, min(int(limit or 25), 200))
+        if self._news_store is None:
+            return {"candidates": [], "last_scan": None, "next_scan_in_seconds": None}
+        candidates = self._news_store.top(limit)
+        last_scan = self._last_scan_dict()
+        next_scan = None
+        if self._news_scheduler is not None:
+            next_scan = self._news_scheduler.seconds_until_next_run()
+        return {
+            "candidates": [
+                {
+                    "symbol": c.symbol,
+                    "score": round(c.score, 4),
+                    "sources": list(c.sources),
+                    "headlines": list(c.headlines),
+                    "first_seen_unix": c.first_seen_unix,
+                    "last_seen_unix": c.last_seen_unix,
+                    "reason": c.reason,
+                }
+                for c in candidates
+            ],
+            "last_scan": last_scan,
+            "next_scan_in_seconds": next_scan,
+        }
+
+    def snapshot_news_channels(self) -> dict[str, Any]:
+        """Overview of every configured news source / channel.
+
+        Each entry combines:
+
+        * ``enabled``       — whether the source name appears in
+          ``[news] enabled_sources`` (config intent);
+        * ``wired``         — whether the aggregator actually constructed
+          a plug-in for that name (config can list unknown sources);
+        * ``disabled_reason`` — self-reported disabled reason (e.g. SEC
+          EDGAR with no ``SEC_USER_AGENT``);
+        * ``weight``        — effective per-source weight multiplier
+          used by the scoring layer;
+        * ``last_scan``     — items_kept / error from the most recent
+          aggregator run for this source.
+
+        Plus a top-level ``last_scan`` block (same shape as ``/news``)
+        and the seconds until the next scheduled scan.
+        """
+        with self._lock:
+            scheduler = self._news_scheduler
+            aggregator = scheduler.aggregator if scheduler is not None else None
+            news_cfg = self._cfg.news
+
+        configured = [str(s).strip().lower() for s in news_cfg.enabled_sources if s]
+        wired_map: dict[str, Any] = {}
+        if aggregator is not None:
+            for src in aggregator.sources:
+                name = str(getattr(src, "name", src.__class__.__name__)).lower()
+                wired_map[name] = src
+
+        last_scan = self._last_scan_dict()
+        per_source_counts = (last_scan or {}).get("per_source_counts") or {}
+        per_source_errors = (last_scan or {}).get("per_source_errors") or {}
+
+        names: list[str] = []
+        for n in configured:
+            if n not in names:
+                names.append(n)
+        for n in wired_map.keys():
+            if n not in names:
+                names.append(n)
+
+        channels: list[dict[str, Any]] = []
+        for name in names:
+            src = wired_map.get(name)
+            disabled_reason = (
+                str(getattr(src, "_disabled_reason", "") or "") if src is not None else ""
+            ) or None
+            weight = aggregator.source_weight(name) if aggregator is not None else None
+            channels.append({
+                "name": name,
+                "enabled": name in configured,
+                "wired": src is not None,
+                "class": src.__class__.__name__ if src is not None else None,
+                "disabled_reason": disabled_reason,
+                "weight": weight,
+                "last_items_kept": int(per_source_counts.get(name, 0) or 0),
+                "last_error": per_source_errors.get(name) or None,
+            })
+
+        next_scan = None
+        if scheduler is not None:
+            next_scan = scheduler.seconds_until_next_run()
+
+        return {
+            "pipeline_enabled": bool(news_cfg.enabled),
+            "scan_interval_minutes": int(news_cfg.scan_interval_minutes),
+            "ttl_hours": int(news_cfg.ttl_hours),
+            "half_life_hours": float(news_cfg.half_life_hours),
+            "channels": channels,
+            "last_scan": last_scan,
+            "next_scan_in_seconds": next_scan,
+        }
+
+    def test_news_channels(
+        self,
+        *,
+        only: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        """Run a side-effect-free dry-run against each configured source.
+
+        Results are not folded into the candidate store — this is a
+        health probe, not an ingest path. ``only`` filters by source
+        name (case-insensitive); unknown names are dropped silently so
+        the caller can pass a user-supplied list verbatim.
+
+        Returns a payload with one :class:`ChannelProbeResult`-shaped
+        dict per probed source plus a tiny summary the renderer can
+        show first.
+        """
+        with self._lock:
+            scheduler = self._news_scheduler
+            aggregator = scheduler.aggregator if scheduler is not None else None
+
+        if aggregator is None:
+            return {
+                "available": False,
+                "results": [],
+                "summary": {"probed": 0, "ok": 0, "failed": 0},
+            }
+
+        known: list[str] = []
+        if self._news_store is not None:
+            try:
+                known = [c.symbol for c in self._news_store.top(50)]
+            except Exception:  # noqa: BLE001 — never let cache shape kill the probe
+                known = []
+
+        results = probe_many(aggregator.sources, only=only, known_symbols=known)
+        ok_count = sum(1 for r in results if r.ok)
+        return {
+            "available": True,
+            "summary": {
+                "probed": len(results),
+                "ok": ok_count,
+                "failed": len(results) - ok_count,
+            },
+            "results": [r.to_dict() for r in results],
+        }
+
+    def _last_scan_dict(self) -> dict[str, Any] | None:
+        """Shared helper: render the aggregator's most-recent run stats."""
+        if self._news_scheduler is None:
+            return None
+        stats = self._news_scheduler.last_stats
+        if stats is None:
+            return None
+        return {
+            "started_at_unix": stats.started_at_unix,
+            "finished_at_unix": stats.finished_at_unix,
+            "items_fetched": stats.items_fetched,
+            "items_kept": stats.items_kept,
+            "observations_recorded": stats.observations_recorded,
+            "per_source_counts": dict(stats.per_source_counts),
+            "per_source_errors": dict(stats.per_source_errors),
         }
 
     def recent_history(self, *, limit: int = 20) -> list[dict[str, Any]]:
@@ -553,5 +777,6 @@ _ALERT_LABELS: dict[AlertType, str] = {
     AlertType.CYCLE_ERROR:        "Cycle crashed",
     AlertType.AI_UNAVAILABLE:     "AI / LLM unavailable",
     AlertType.UNIVERSE_CHANGED:   "Tracked universe changed",
+    AlertType.UNIVERSE_REJECTED:  "Universe candidates rejected (activity filter)",
     AlertType.BOT_PAUSED_RESUMED: "Bot paused / resumed",
 }

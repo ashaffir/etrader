@@ -4,3 +4,5 @@
 
 requests>=2.31,<3            # HTTP client for the eToro Public API
 openai>=1.40,<2              # Azure OpenAI / Foundry chat completions client
+yfinance>=0.2.40,<1          # Yahoo Finance news + fundamentals (universe + fundamentals cache)
+feedparser>=6.0.10,<7        # RSS/Atom parsing for Google News, Yahoo, SEC EDGAR news sources

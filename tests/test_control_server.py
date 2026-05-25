@@ -21,8 +21,10 @@ from src.config import (
     AzureCredentials,
     ControlServiceConfig,
     EtoroCredentials,
+    FundamentalsConfig,
     GuardrailsConfig,
     LoggingConfig,
+    NewsConfig,
     OperationsConfig,
     StrategyConfig,
     ToolsConfig,
@@ -51,6 +53,8 @@ def _build_app_cfg() -> AppConfig:
         guardrails=GuardrailsConfig(),
         operations=OperationsConfig(trade_spacing_seconds=0),
         universe=UniverseConfig(),
+        news=NewsConfig(enabled=False),
+        fundamentals=FundamentalsConfig(enabled=False),
         strategy=StrategyConfig(),
         ai=AiConfig(enabled=False),
         tools=ToolsConfig(enabled=False),
@@ -244,6 +248,31 @@ class ControlServerTests(unittest.TestCase):
             token="secret-token-test",
         )
         self.assertEqual(st, 400)
+
+    # ----- /news/channels endpoints ------------------------------------------
+
+    def test_news_channels_returns_payload_when_pipeline_absent(self) -> None:
+        # No news pipeline wired in this controller -> empty channels list,
+        # but the endpoint must still 200 with the documented shape.
+        st, body = _http_get(
+            f"{self.base}/news/channels", token="secret-token-test",
+        )
+        self.assertEqual(st, 200)
+        assert body is not None
+        self.assertIn("channels", body)
+        self.assertIn("pipeline_enabled", body)
+        self.assertIsNone(body.get("last_scan"))
+
+    def test_news_channels_test_returns_unavailable_when_no_pipeline(self) -> None:
+        st, body = _http_post(
+            f"{self.base}/news/channels/test",
+            token="secret-token-test",
+            body={},
+        )
+        self.assertEqual(st, 200)
+        assert body is not None
+        self.assertFalse(body.get("available"))
+        self.assertEqual(body["summary"]["probed"], 0)
 
     def test_alerts_pending_drains_queue(self) -> None:
         # Pause emits a BOT_PAUSED_RESUMED alert. Subscribe chat 101 first

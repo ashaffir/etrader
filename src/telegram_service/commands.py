@@ -19,11 +19,20 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .alerts_menu import build_alerts_caption, build_alerts_keyboard
+from .channel_formatter import (
+    format_channels_help,
+    format_channels_logs,
+    format_channels_overview,
+    format_channels_test,
+    parse_channels_args,
+)
 from .control_client import ControlAPIClient, ControlAPIError
 from .formatters import (
+    format_fundamentals,
     format_guardrails,
     format_help,
     format_history,
+    format_news,
     format_panic_result,
     format_portfolio,
     format_signals,
@@ -123,6 +132,38 @@ def _h_universe(ctx: CommandContext) -> str:
     return format_universe(ctx.api.universe())
 
 
+def _h_news(ctx: CommandContext) -> str:
+    limit = 25
+    if ctx.cmd.args:
+        try:
+            limit = max(1, min(100, int(ctx.cmd.args.split()[0])))
+        except (ValueError, IndexError):
+            pass
+    return format_news(ctx.api.news(limit=limit))
+
+
+def _h_channels(ctx: CommandContext) -> str:
+    """``/channels [test|logs] [name1,name2,...]`` — inspect news sources."""
+    raw = (ctx.cmd.args or "").strip()
+    if raw.lower() in {"help", "?", "-h", "--help"}:
+        return format_channels_help()
+
+    subcommand, names = parse_channels_args(raw)
+    if subcommand == "test":
+        payload = ctx.api.news_channels_test(only=names or None)
+        return format_channels_test(payload)
+    if subcommand == "logs":
+        return format_channels_logs(ctx.api.news_channels())
+    return format_channels_overview(ctx.api.news_channels())
+
+
+def _h_fundamentals(ctx: CommandContext) -> str:
+    """``/fundamentals [SYMBOL]`` — list cached symbols or one detail view."""
+    raw = ctx.cmd.args.strip()
+    symbol = raw.split()[0] if raw else None
+    return format_fundamentals(ctx.api.fundamentals(symbol=symbol))
+
+
 def _h_signals(ctx: CommandContext) -> str:
     return format_signals(ctx.api.strategy_signals())
 
@@ -213,6 +254,12 @@ _COMMANDS: dict[str, CommandHandler] = {
     "status": _h_status,
     "portfolio": _h_portfolio,
     "universe": _h_universe,
+    "news": _h_news,
+    "channels": _h_channels,
+    "sources": _h_channels,  # alias
+    "feeds": _h_channels,    # alias
+    "fundamentals": _h_fundamentals,
+    "fund": _h_fundamentals,  # alias
     "signals": _h_signals,
     "rules": _h_signals,        # alias
     "strategy": _h_signals,     # alias

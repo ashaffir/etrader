@@ -8,6 +8,7 @@ linear; readability beats cleverness when something goes wrong at 3 AM.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,6 +33,8 @@ from .etoro.trading import (
 )
 from .execution.executor import ExecutionResult, TradeExecutor
 from .execution.monitor import PositionMonitor
+from .fundamentals import FundamentalsCache
+from .news.scheduler import NewsScheduler
 from .state import BotState
 from .strategy.decisions import DecisionEngine, DecisionResult, render_decisions
 from .strategy.risk import RiskEvaluator, aggregate_summary
@@ -78,6 +81,9 @@ class CycleRunner:
         history: TradeHistoryLog | None = None,
         tool_orchestrator: ToolOrchestrator | None = None,
         alerts: AlertHub | None = None,
+        news_scheduler: NewsScheduler | None = None,
+        fundamentals_cache: FundamentalsCache | None = None,
+        stop_event: threading.Event | None = None,
     ) -> None:
         self._cfg = cfg
         self._etoro = etoro
@@ -93,6 +99,14 @@ class CycleRunner:
         self._history = history
         self._tools = tool_orchestrator
         self._alerts = alerts
+        self._news_scheduler = news_scheduler
+        # Optional Phase-3 fundamentals cache. When present we top it
+        # up on every universe refresh and project a trim dict into
+        # the LLM decision prompt for each candidate.
+        self._fundamentals = fundamentals_cache
+        # Optional stop signal so synchronous I/O in the cycle can be
+        # short-circuited mid-flight. Set by the SIGINT/SIGTERM handler.
+        self._stop_event = stop_event
         # State-change tracking so we only emit AI_UNAVAILABLE / DAILY_LOSS_HALT
         # alerts on edges, not every cycle.
         self._last_ai_available: bool | None = None
@@ -100,16 +114,20 @@ class CycleRunner:
         self._last_universe_symbols: tuple[str, ...] = ()
 
     def initial_universe(self) -> CycleContext:
-        universe = self._universe_builder.build()
+        # First news scan happens before the first universe build so the
+        # candidate store is warm. Forced run on boot — operators expect
+        # to see real data on cycle 1, not "wait an hour for the scan".
+        if self._news_scheduler is not None:
+            self._log.info("[news] initial scan starting…")
+            self._news_scheduler.maybe_run(force=True)
+        universe = self._universe_builder.build(must_include={})
         ctx = CycleContext(
             universe=universe,
             last_universe_refresh_monotonic=time.monotonic(),
         )
-        self._log.info(
-            "[universe] tracking %d instrument(s): base=%d, llm=%d",
-            len(universe), universe.base_count, universe.llm_count,
-        )
+        self._log.info("[universe] initial → %s", universe.summary_line())
         self._cache_instrument_metadata(universe, ctx.instrument_metas)
+        self._refresh_fundamentals(universe)
         self._publish_universe(universe)
         # Seed the diff baseline so the first refresh isn't reported as a
         # "universe changed" alert.
@@ -128,7 +146,12 @@ class CycleRunner:
         )
         if self._telemetry is not None:
             self._telemetry.mark_cycle_started(self._state.cycle_count)
+        self._maybe_run_news_scan(ctx)
+        if self._abort_if_stopping("after news scan"):
+            return
         self._maybe_refresh_universe(ctx)
+        if self._abort_if_stopping("after universe refresh"):
+            return
 
         rates = self._fetch_rates(ctx.universe, prior=ctx.rate_cache)
         ctx.rate_cache.update(rates)
@@ -138,9 +161,12 @@ class CycleRunner:
             p for p in snapshot.positions
             if p.position_id in self._state.bot_owned_positions and p.mirror_id == 0
         ]
+        self._update_owned_instrument_ids(ctx, bot_owned_positions)
         self._publish_portfolio(snapshot, bot_owned_position_ids=[
             p.position_id for p in bot_owned_positions
         ], symbol_for_id=ctx.universe.symbol_for_id)
+        if self._abort_if_stopping("after portfolio fetch"):
+            return
 
         candles_by_instrument = self._fetch_candles(ctx.universe)
         candidates = build_candidates(
@@ -188,6 +214,9 @@ class CycleRunner:
             guardrails=self._cfg.guardrails,
             tools=[],
         )
+        if self._abort_if_stopping("before LLM decision"):
+            return
+        fundamentals_payload = self._fundamentals_for_candidates(candidates)
         decision = self._decision_engine.decide(
             candidates=candidates,
             portfolio_summary=summary,
@@ -196,6 +225,7 @@ class CycleRunner:
             tool_results=tool_results,
             cross_asset_regime=cross_asset_regime,
             strategy_rules=rules_payload,
+            fundamentals_by_symbol=fundamentals_payload,
         )
         latency_str = f", {decision.latency_ms} ms" if decision.latency_ms is not None else ""
         self._log.info(
@@ -228,6 +258,8 @@ class CycleRunner:
             ", ".join(denied_msgs) if denied_msgs else "all clear",
         )
 
+        if self._abort_if_stopping("before order execution"):
+            return
         results = self._executor.execute_all(
             verdicts=verdicts, rates=rates, state=self._state,
         )
@@ -254,20 +286,144 @@ class CycleRunner:
 
     # ------------------------------------------------------------------
 
+    def _abort_if_stopping(self, where: str) -> bool:
+        """Return True (and log) if a shutdown has been requested.
+
+        Cycle phases call this between long-running synchronous steps so
+        Ctrl-C feels responsive even mid-cycle. We never abort *during*
+        order execution — only before — to avoid leaving the broker in
+        an inconsistent state.
+        """
+        if self._stop_event is not None and self._stop_event.is_set():
+            self._log.info("[cycle] stop requested — aborting %s", where)
+            if self._telemetry is not None:
+                self._telemetry.mark_cycle_finished()
+            return True
+        return False
+
+    def _maybe_run_news_scan(self, ctx: CycleContext) -> None:
+        """Let the news scheduler decide whether a scan is due.
+
+        ``known_symbols`` is the current universe + any pending owned-
+        position symbols, so per-ticker sources (yfinance, Yahoo RSS)
+        always enrich what we already care about.
+        """
+        if self._news_scheduler is None:
+            return
+        known = set(ctx.universe.symbol_for_id.values())
+        known.update(self._state.bot_owned_instrument_ids.values())
+        self._news_scheduler.maybe_run(known_symbols=known)
+
     def _maybe_refresh_universe(self, ctx: CycleContext) -> None:
         elapsed_min = (time.monotonic() - ctx.last_universe_refresh_monotonic) / 60.0
         if elapsed_min < self._cfg.operations.universe_refresh_minutes:
             return
         self._log.info("[universe] refreshing (after %.1f min)", elapsed_min)
-        ctx.universe = self._universe_builder.build()
-        ctx.last_universe_refresh_monotonic = time.monotonic()
-        self._log.info(
-            "[universe] now tracking %d instrument(s): base=%d, llm=%d",
-            len(ctx.universe), ctx.universe.base_count, ctx.universe.llm_count,
+        ctx.universe = self._universe_builder.build(
+            must_include=dict(self._state.bot_owned_instrument_ids),
         )
+        ctx.last_universe_refresh_monotonic = time.monotonic()
+        self._log.info("[universe] refreshed → %s", ctx.universe.summary_line())
         self._cache_instrument_metadata(ctx.universe, ctx.instrument_metas)
+        self._refresh_fundamentals(ctx.universe)
         self._publish_universe(ctx.universe)
         self.emit_universe_change(ctx.universe)
+
+    def _fundamentals_for_candidates(
+        self,
+        candidates: Iterable,
+    ) -> dict[str, dict]:
+        """Return ``{SYMBOL: trim_fundamentals_dict}`` for prompt enrichment.
+
+        Returns an empty dict when:
+        - the cache isn't wired,
+        - ``[fundamentals] enrich_decision_prompt = false``, or
+        - the universe is empty.
+        """
+        if self._fundamentals is None:
+            return {}
+        if not getattr(self._cfg.fundamentals, "enrich_decision_prompt", True):
+            return {}
+        from .fundamentals.prompt import project_for_llm  # local: avoid heavy imports at module load
+
+        out: dict[str, dict] = {}
+        for c in candidates:
+            sym = (getattr(c, "symbol", "") or "").upper()
+            if not sym:
+                continue
+            snap = self._fundamentals.get(sym)
+            if snap is None:
+                continue
+            out[sym] = project_for_llm(snap)
+        return out
+
+    def _refresh_fundamentals(self, universe: TrackedUniverse) -> None:
+        """Top up the fundamentals cache for the currently tracked symbols.
+
+        Only stale entries are re-fetched (see
+        :meth:`FundamentalsCache.is_stale`); refreshing is capped at
+        ``budget_per_refresh`` so the cycle never blocks on a long
+        chain of yfinance calls. The stop event is honoured between
+        symbols so Ctrl-C bails out quickly.
+        """
+        if self._fundamentals is None:
+            return
+        symbols = [universe.symbol_for_id.get(i, "") for i in universe.instrument_ids]
+        symbols = [s for s in symbols if s]
+        if not symbols:
+            return
+        is_stopping = (
+            self._stop_event.is_set if self._stop_event is not None else None
+        )
+        results = self._fundamentals.refresh(
+            symbols,
+            budget=int(self._cfg.fundamentals.budget_per_refresh),
+            is_stopping=is_stopping,
+        )
+        refreshed = sum(1 for v in results.values() if v == "refreshed")
+        failed = sum(1 for v in results.values() if v == "failed")
+        skipped = sum(1 for v in results.values() if v == "skipped")
+        if refreshed or failed or skipped:
+            self._log.info(
+                "[fundamentals] refreshed=%d failed=%d skipped=%d (cache size %d)",
+                refreshed, failed, skipped, len(self._fundamentals),
+            )
+
+    def _update_owned_instrument_ids(
+        self,
+        ctx: CycleContext,
+        bot_owned_positions: Iterable,
+    ) -> None:
+        """Refresh ``state.bot_owned_instrument_ids`` from the latest snapshot.
+
+        Called after every portfolio reconcile so the next universe
+        refresh knows which instruments must remain tracked. If a newly-
+        opened position's instrument isn't currently tracked, force the
+        next ``_maybe_refresh_universe`` call to fire on the next cycle
+        (instead of waiting up to ``universe_refresh_minutes``).
+        """
+        symbol_for_id = ctx.universe.symbol_for_id
+        owned: dict[int, str] = {}
+        for p in bot_owned_positions:
+            inst_id = int(getattr(p, "instrument_id", 0) or 0)
+            if not inst_id:
+                continue
+            owned[inst_id] = symbol_for_id.get(inst_id, f"INST-{inst_id}")
+        previous_keys = set(self._state.bot_owned_instrument_ids.keys())
+        self._state.bot_owned_instrument_ids = owned
+
+        unseen = [i for i in owned if i not in symbol_for_id]
+        if unseen and set(unseen) - previous_keys:
+            self._log.info(
+                "[universe] %d owned instrument(s) not in tracked set "
+                "(%s) — forcing universe refresh on next cycle",
+                len(unseen),
+                ", ".join(str(i) for i in unseen[:5]),
+            )
+            # Backdate the refresh timer so _maybe_refresh_universe
+            # fires on the next cycle entry; no need to bypass the
+            # rate/candle work already done this cycle.
+            ctx.last_universe_refresh_monotonic = 0.0
 
     def _cache_instrument_metadata(
         self,
@@ -374,11 +530,18 @@ class CycleRunner:
             return
         ids = list(universe.instrument_ids)
         symbols = [universe.symbol_for_id.get(i, str(i)) for i in ids]
+        reasons = {
+            universe.symbol_for_id.get(i, str(i)): universe.reason_for_id.get(i, "")
+            for i in ids
+        }
         self._telemetry.update_universe(
             instrument_ids=ids,
             symbols=symbols,
             base_count=universe.base_count,
             llm_count=universe.llm_count,
+            reasons=reasons,
+            source_counts=universe.source_counts,
+            rejected=universe.rejected,
         )
 
     def _publish_portfolio(
@@ -535,10 +698,17 @@ class CycleRunner:
             self._last_ai_available = currently_available
 
     def emit_universe_change(self, universe: TrackedUniverse) -> None:
-        """Diff against the last published universe; emit on add/remove."""
+        """Diff against the last published universe; emit on add/remove.
+
+        Also emits the opt-in :data:`AlertType.UNIVERSE_REJECTED` when
+        the refresh produced activity-filter rejections — operators
+        tuning ``[universe] min_atr_pct`` / ``max_spread_pct`` rely on
+        this to see *why* a promising news ticker didn't make the cut.
+        """
         current_symbols = tuple(
             sorted(universe.symbol_for_id.get(i, str(i)) for i in universe.instrument_ids)
         )
+        self._emit_universe_rejected_if_any(universe)
         if not self._last_universe_symbols:
             self._last_universe_symbols = current_symbols
             return
@@ -557,6 +727,26 @@ class CycleRunner:
             body=" • ".join(bits) if bits else "rotation refreshed",
         )
         self._last_universe_symbols = current_symbols
+
+    def _emit_universe_rejected_if_any(self, universe: TrackedUniverse) -> None:
+        """Surface up to the first 10 rejection reasons. No-op if none.
+
+        Bounded to avoid spamming a chat when 50 candidates fail the
+        filter on a quiet market day; ``/universe`` shows the full
+        list for an operator that wants details.
+        """
+        rejected = getattr(universe, "rejected", None) or {}
+        if not rejected:
+            return
+        sample = list(rejected.items())[:10]
+        body = "\n".join(f"• {sym}: {reason}" for sym, reason in sample)
+        if len(rejected) > 10:
+            body += f"\n… and {len(rejected) - 10} more (see /universe)"
+        self._emit(
+            AlertType.UNIVERSE_REJECTED,
+            title=f"UNIVERSE REJECTED ({len(rejected)})",
+            body=body,
+        )
 
     def emit_cycle_error(self, message: str) -> None:
         self._emit(

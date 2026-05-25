@@ -39,6 +39,8 @@ PERSISTED_SECTIONS: tuple[str, ...] = (
     "guardrails",
     "operations",
     "universe",
+    "news",
+    "fundamentals",
     "strategy",
     "ai",
     "tools",
@@ -222,6 +224,47 @@ class ConfigStore:
             self._upsert(_flatten(sections))
             self._set_meta("first_snapshot_unix", str(time.time()))
             return True
+
+    def add_missing_sections(self, sections: dict[str, dict[str, Any]]) -> list[str]:
+        """Backfill new sections introduced after first-run snapshot.
+
+        For each ``(section, fields)`` in ``sections``:
+        - If the store has *zero* rows for that section, write every
+          field in one transaction.
+        - If the store already has at least one row, leave it alone
+          (existing operator edits are authoritative).
+
+        Returns the list of section names that were backfilled.
+        Used when adding a new config block (e.g. ``[fundamentals]``)
+        to an existing deployment so operators don't have to delete
+        ``data/config.sqlite`` to pick up new defaults.
+        """
+        added: list[str] = []
+        with self._lock:
+            for section, fields in sections.items():
+                if self._section_has_any(section):
+                    continue
+                if not fields:
+                    continue
+                self._upsert([(section, k, v) for k, v in fields.items()])
+                added.append(section)
+        if added:
+            self._set_meta(
+                "last_migration_unix",
+                f"{time.time()}:{'+'.join(added)}",
+            )
+        return added
+
+    def _section_has_any(self, section: str) -> bool:
+        try:
+            cur = self._conn.execute(
+                "SELECT 1 FROM config WHERE section = ? LIMIT 1",
+                (section,),
+            )
+            return cur.fetchone() is not None
+        except sqlite3.Error as exc:
+            self._log.warning("[config_store] section probe failed (%s): %s", section, exc)
+            return False
 
     def delete_field(self, section: str, key: str) -> None:
         with self._lock:

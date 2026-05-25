@@ -42,6 +42,11 @@ class BotState:
     session_baseline_equity: float | None = None
     last_action_per_instrument: dict[int, float] = field(default_factory=dict)
     bot_owned_positions: set[int] = field(default_factory=set)
+    # Instrument IDs corresponding to currently open, bot-owned positions.
+    # Updated by the cycle right after every portfolio reconcile so the
+    # universe builder can pin them as `must_include` on the next
+    # refresh (we never want to lose sight of a position we own).
+    bot_owned_instrument_ids: dict[int, str] = field(default_factory=dict)
     cycle_count: int = 0
     halted_today: bool = False
     halted_day: str | None = None  # YYYY-MM-DD UTC, used to auto-reset

@@ -80,6 +80,16 @@ class ControlAPIClient:
     def universe(self) -> dict[str, Any]:
         return self._request("GET", "/universe")
 
+    def news(self, *, limit: int = 25) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 200))
+        return self._request("GET", f"/news?limit={limit}")
+
+    def fundamentals(self, *, symbol: str | None = None) -> dict[str, Any]:
+        if symbol:
+            from urllib.parse import quote
+            return self._request("GET", f"/fundamentals?symbol={quote(symbol.strip())}")
+        return self._request("GET", "/fundamentals")
+
     def history(self, *, limit: int = 20) -> dict[str, Any]:
         limit = max(1, min(int(limit), 200))
         return self._request("GET", f"/history?limit={limit}")
@@ -104,6 +114,17 @@ class ControlAPIClient:
 
     def strategy_signals(self) -> dict[str, Any]:
         return self._request("GET", "/strategy/signals")
+
+    def news_channels(self) -> dict[str, Any]:
+        return self._request("GET", "/news/channels")
+
+    def news_channels_test(
+        self, *, only: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if only:
+            body["only"] = list(only)
+        return self._request("POST", "/news/channels/test", body=body or None)
 
     # -- alerts ---------------------------------------------------------
 
