@@ -20,6 +20,7 @@ from ..config import AiConfig, GuardrailsConfig
 from ..etoro.trading import Position
 from .autotune_parse import parse_tune_request
 from .autotune_types import TuneRequest
+from .decision_parser import parse_actions
 from .risk import TradeRequest
 from .signals import Candidate
 from .tools.runner import ToolRunResult
@@ -68,6 +69,9 @@ class DecisionEngine:
         strategy_rules: Mapping[str, Any] | None = None,
         fundamentals_by_symbol: Mapping[str, Mapping[str, Any]] | None = None,
         autotune_evidence: Mapping[str, Any] | None = None,
+        performance: Mapping[str, Any] | None = None,
+        enriched_owned_positions: Sequence[Mapping[str, Any]] | None = None,
+        position_units_by_id: Mapping[int, float] | None = None,
     ) -> DecisionResult:
         tool_results = tool_results or {}
 
@@ -95,8 +99,19 @@ class DecisionEngine:
                     strategy_rules=strategy_rules,
                     fundamentals_by_symbol=fundamentals_by_symbol or {},
                     autotune_evidence=autotune_evidence,
+                    performance=performance,
+                    enriched_owned_positions=enriched_owned_positions,
                 )
-                requests = self._requests_from_llm(ai_result.parsed_json, candidates, bot_owned_positions)
+                requests = parse_actions(
+                    ai_result.parsed_json,
+                    candidates=candidates,
+                    bot_owned_positions=bot_owned_positions,
+                    guardrails=self._guardrails,
+                    position_units_by_id=position_units_by_id or {},
+                    logger=self._logger,
+                )
+                if requests is None:
+                    requests = self._deterministic_requests(candidates, bot_owned_positions)
                 tuning = self._tuning_from_llm(ai_result.parsed_json)
                 return DecisionResult(
                     requests=requests,
@@ -143,20 +158,28 @@ class DecisionEngine:
         strategy_rules: Mapping[str, Any] | None,
         fundamentals_by_symbol: Mapping[str, Mapping[str, Any]],
         autotune_evidence: Mapping[str, Any] | None,
+        performance: Mapping[str, Any] | None = None,
+        enriched_owned_positions: Sequence[Mapping[str, Any]] | None = None,
     ) -> AiCallResult:
         assert self._ai_client is not None
-        owned = [
-            {
-                "instrumentId": p.instrument_id,
-                "symbol": symbol_for_id.get(p.instrument_id, str(p.instrument_id)),
-                "positionId": p.position_id,
-                "amount": p.amount,
-                "openRate": p.open_rate,
-                "pnl": p.pnl,
-                "isBuy": p.is_buy,
-            }
-            for p in bot_owned_positions
-        ]
+        # Prefer the cycle's enriched view (MFE/MAE/time_held/stops/review)
+        # over the bare broker fields. Fall back to the legacy minimal
+        # projection when the cycle hasn't been wired yet.
+        if enriched_owned_positions is not None:
+            owned: list[Mapping[str, Any]] = list(enriched_owned_positions)
+        else:
+            owned = [
+                {
+                    "instrumentId": p.instrument_id,
+                    "symbol": symbol_for_id.get(p.instrument_id, str(p.instrument_id)),
+                    "positionId": p.position_id,
+                    "amount": p.amount,
+                    "openRate": p.open_rate,
+                    "pnl": p.pnl,
+                    "isBuy": p.is_buy,
+                }
+                for p in bot_owned_positions
+            ]
         cands = [
             self._candidate_to_dict(
                 c,
@@ -181,6 +204,7 @@ class DecisionEngine:
             cross_asset_regime=cross_asset_regime,
             strategy_rules=strategy_rules,
             autotune_evidence=autotune_evidence,
+            performance=performance,
         )
         return self._ai_client.chat_json(system=system, user=user, require_json=True)
 
@@ -190,52 +214,6 @@ class DecisionEngine:
         if not isinstance(parsed, dict):
             return TuneRequest()
         return parse_tune_request(parsed.get("tuning"))
-
-    def _requests_from_llm(
-        self,
-        parsed: Any,
-        candidates: Sequence[Candidate],
-        bot_owned_positions: Sequence[Position],
-    ) -> list[TradeRequest]:
-        if not parsed or not isinstance(parsed, dict):
-            self._logger.warning("LLM returned no parsable JSON; falling back deterministic")
-            return self._deterministic_requests(candidates, bot_owned_positions)
-        actions = parsed.get("actions") or []
-        if not isinstance(actions, list):
-            return self._deterministic_requests(candidates, bot_owned_positions)
-        cand_by_inst = {c.instrument_id: c for c in candidates}
-        owned_by_inst: dict[int, Position] = {p.instrument_id: p for p in bot_owned_positions}
-        out: list[TradeRequest] = []
-        for entry in actions:
-            if not isinstance(entry, dict):
-                continue
-            action = str(entry.get("action", "HOLD")).upper()
-            if action == "HOLD":
-                continue
-            try:
-                inst_id = int(entry.get("instrumentId") or 0)
-            except (TypeError, ValueError):
-                continue
-            cand = cand_by_inst.get(inst_id)
-            symbol = (cand.symbol if cand else str(entry.get("symbol", inst_id))).upper()
-            if action == "BUY":
-                amount = self._safe_float(entry.get("amount_usd"), default=0.0)
-                if amount <= 0:
-                    amount = float(self._guardrails.max_per_trade_usd)
-                amount = min(amount, float(self._guardrails.max_per_trade_usd))
-                out.append(TradeRequest(
-                    instrument_id=inst_id, symbol=symbol, action="BUY",
-                    amount_usd=amount, position_id=None,
-                ))
-            elif action == "CLOSE":
-                pos = owned_by_inst.get(inst_id)
-                if pos is None:
-                    continue
-                out.append(TradeRequest(
-                    instrument_id=inst_id, symbol=symbol, action="CLOSE",
-                    amount_usd=0.0, position_id=pos.position_id,
-                ))
-        return out
 
     def _deterministic_requests(
         self,
@@ -323,12 +301,6 @@ class DecisionEngine:
             return str(parsed.get("summary") or "").strip()
         return ""
 
-    @staticmethod
-    def _safe_float(v: Any, *, default: float = 0.0) -> float:
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return default
 
 
 def render_decisions(requests: Iterable[TradeRequest]) -> str:

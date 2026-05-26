@@ -34,6 +34,7 @@ from ..etoro.market_data import LiveRate
 from ..etoro.trading import Position, PortfolioSnapshot
 from ..state import BotState
 from ..strategy.tools.base import AssetClass
+from .dynamic_stops import DynamicStopsStore
 from .stuck_orders import (
     CancelResult,
     StuckOrder,
@@ -50,6 +51,7 @@ class PositionMonitor:
         self,
         *,
         logger: logging.Logger | logging.LoggerAdapter | None = None,
+        dynamic_stops: DynamicStopsStore | None = None,
     ) -> None:
         self._tracked: dict[int, TrackedOrder] = {}
         self._log = logger or logging.getLogger("etrader.execution.monitor")
@@ -58,6 +60,7 @@ class PositionMonitor:
             on_settled=self._evict,
             logger=self._log,
         )
+        self._dynamic_stops = dynamic_stops
 
     # ------------------------------------------------------------------
     # Recording placements
@@ -202,6 +205,14 @@ class PositionMonitor:
         stop_loss_pct: float,
         take_profit_pct: float,
     ) -> list[Position]:
+        """Return bot-owned positions whose live mid breaches their SL/TP.
+
+        Per-position dynamic bands set via the LLM's MODIFY_STOPS action
+        override the static ``stop_loss_pct`` / ``take_profit_pct``
+        arguments. Trailing stops ratchet up on each call when MFE
+        increases, so this method has the side effect of updating the
+        :class:`DynamicStopsStore` over time.
+        """
         out: list[Position] = []
         for pos in bot_owned:
             rate = rates.get(pos.instrument_id)
@@ -211,9 +222,37 @@ class PositionMonitor:
             change_pct = (mid - pos.open_rate) / pos.open_rate * 100.0
             if not pos.is_buy:
                 change_pct = -change_pct
-            if change_pct <= -stop_loss_pct or change_pct >= take_profit_pct:
+            sl_pct, tp_pct, sl_floor = self._resolve_bands(
+                pos, change_pct, stop_loss_pct, take_profit_pct,
+            )
+            # Standard SL: change_pct ≤ -sl_pct → breach.
+            # Trailing SL: change_pct ≤ sl_floor (floor is signed:
+            # positive once we're locked above entry) → breach.
+            if (
+                change_pct <= -sl_pct
+                or (sl_floor is not None and change_pct <= sl_floor)
+                or change_pct >= tp_pct
+            ):
                 out.append(pos)
         return out
+
+    def _resolve_bands(
+        self,
+        pos: Position,
+        change_pct: float,
+        fallback_sl_pct: float,
+        fallback_tp_pct: float,
+    ) -> tuple[float, float, float | None]:
+        """Pick SL/TP for this position from the dynamic-stops store."""
+        if self._dynamic_stops is None:
+            return fallback_sl_pct, fallback_tp_pct, None
+        # Ratchet trailing first so the floor we return is fresh.
+        self._dynamic_stops.ratchet_trailing(
+            pos.position_id, current_pnl_pct=change_pct,
+        )
+        band = self._dynamic_stops.effective_band(pos.position_id)
+        floor = self._dynamic_stops.trailing_floor_pct(pos.position_id)
+        return band.stop_loss_pct, band.take_profit_pct, floor
 
     # ------------------------------------------------------------------
     # Internals

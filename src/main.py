@@ -31,6 +31,7 @@ from .cycle import CycleRunner
 from .etoro.client import EtoroClient
 from .etoro.identity import fetch_identity
 from .etoro.instrument_cache import InstrumentCache
+from .execution.dynamic_stops import DynamicStopsStore
 from .execution.executor import TradeExecutor
 from .execution.monitor import PositionMonitor
 from .fundamentals import FundamentalsCache, build_fundamentals_cache
@@ -38,11 +39,13 @@ from .logging_setup import configure_logging, get_logger
 from .news.candidate_store import CandidateStore
 from .news.factory import build_news_pipeline
 from .news.scheduler import NewsScheduler
+from .performance import PerformanceTracker
 from .persistence import StatePersistence
 from .state import BotState
 from .strategy.activity_filter import ActivityFilter
 from .strategy.autotune import AutotuneState
 from .strategy.decisions import DecisionEngine
+from .strategy.position_review import PositionReviewer, PositionReviewConfig
 from .strategy.risk import RiskEvaluator
 from .strategy.tool_orchestration import ToolOrchestrator
 from .strategy.universe import UniverseBuilder
@@ -116,6 +119,19 @@ class TradingBot:
             self.controller.set_fundamentals(self._fundamentals)
         self._autotune = self._build_autotune_state()
         self.controller.set_autotune_state(self._autotune)
+        self._performance = PerformanceTracker(
+            project_root / "data",
+            logger=get_logger("performance", tag="perf"),
+        )
+        self.controller.set_performance_tracker(self._performance)
+        pr_dc = getattr(cfg, "position_review", None)
+        self._position_review_cfg = PositionReviewConfig(
+            drawdown_pct=float(pr_dc.drawdown_pct) if pr_dc else 2.0,
+            pullback_pct=float(pr_dc.pullback_pct) if pr_dc else 3.0,
+            stale_hold_minutes=float(pr_dc.stale_hold_minutes) if pr_dc else 60.0,
+            stale_threshold_pct=float(pr_dc.stale_threshold_pct) if pr_dc else 0.5,
+            max_hold_minutes=float(pr_dc.max_hold_minutes) if pr_dc else 240.0,
+        )
         self._control_server = self._maybe_start_control_server()
         self._runner = self._build_runner()
 
@@ -202,14 +218,31 @@ class TradingBot:
 
     def _build_runner(self) -> CycleRunner:
         risk = RiskEvaluator(self.cfg.guardrails)
+        dynamic_stops = DynamicStopsStore(
+            default_stop_loss_pct=self.cfg.guardrails.default_stop_loss_pct,
+            default_take_profit_pct=self.cfg.guardrails.default_take_profit_pct,
+            logger=get_logger("execution.dynamic_stops", tag="stops"),
+        )
+        restored_stops = self._persistence.load_dynamic_stops()
+        if restored_stops:
+            dynamic_stops.restore(restored_stops)
+        self.controller.set_dynamic_stops(dynamic_stops)
         executor = TradeExecutor(
             client=self._etoro,
             env=self.cfg.env_segment,
             guardrails=self.cfg.guardrails,
             operations=self.cfg.operations,
             logger=get_logger("execution.executor", tag="exec"),
+            dynamic_stops=dynamic_stops,
         )
-        monitor = PositionMonitor(logger=get_logger("execution.monitor", tag="monitor"))
+        monitor = PositionMonitor(
+            logger=get_logger("execution.monitor", tag="monitor"),
+            dynamic_stops=dynamic_stops,
+        )
+        position_reviewer = PositionReviewer(
+            self._position_review_cfg,
+            logger=get_logger("strategy.position_review", tag="review"),
+        )
         decision_engine = DecisionEngine(
             ai_cfg=self.cfg.ai,
             guardrails=self.cfg.guardrails,
@@ -245,6 +278,9 @@ class TradingBot:
             news_scheduler=self._news_scheduler,
             fundamentals_cache=self._fundamentals,
             autotune_state=self._autotune,
+            performance=self._performance,
+            dynamic_stops=dynamic_stops,
+            position_reviewer=position_reviewer,
             stop_event=self._stop_event,
             log=get_logger("cycle", tag="cycle"),
         )

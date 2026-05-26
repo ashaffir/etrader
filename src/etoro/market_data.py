@@ -67,6 +67,20 @@ def fetch_rates(client: EtoroClient, instrument_ids: Sequence[int]) -> dict[int,
 # Instrument metadata
 # ---------------------------------------------------------------------------
 
+# eToro's ``priceSource`` is the most reliable asset-class signal we
+# get from /market-data/instruments:
+#   - real equity exchanges (NASDAQ, NYSE, LSE, ...) → STOCK or ETF
+#   - "eToro" → in-house crypto book
+#   - currency tickers (USD, EUR, JPY, ...) → FX
+# We use it in :func:`InstrumentMeta.is_crypto` and in
+# :func:`src.strategy.tools.base.asset_class_for` to override the
+# notoriously wrong ``instrumentTypeID`` field (eToro returns
+# ``instrumentTypeID=5`` for cash equities like AMD/AAPL/LUNR and
+# ``instrumentTypeID=10`` for crypto, which is the opposite of what
+# the docs imply).
+_ETORO_CRYPTO_PRICE_SOURCE = "etoro"
+
+
 @dataclass(frozen=True)
 class InstrumentMeta:
     instrument_id: int
@@ -77,14 +91,35 @@ class InstrumentMeta:
     raw: dict[str, Any]
 
     @property
+    def price_source(self) -> str | None:
+        return self.raw.get("priceSource") if isinstance(self.raw, dict) else None
+
+    @property
+    def stocks_industry_id(self) -> int | None:
+        if not isinstance(self.raw, dict):
+            return None
+        v = self.raw.get("stocksIndustryID") or self.raw.get("stocksIndustryId")
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
     def is_crypto(self) -> bool:
-        # eToro internal type ids: 5 = crypto. Heuristic — also fall back
-        # to a name suffix check so we never trade unleveraged-crypto under
-        # a leveraged caller's expectations.
-        if self.instrument_type_id == 5:
+        # Authoritative signal: eToro hosts every crypto in its in-house
+        # book and stamps ``priceSource = "eToro"`` on them. Cash equities
+        # carry a real exchange name (NASDAQ, NYSE, …). We deliberately
+        # do NOT trust ``instrument_type_id`` here because eToro returns
+        # 5 for stocks and 10 for crypto (verified live across 11
+        # instruments) — the opposite of what one would guess.
+        src = (self.price_source or "").strip().lower()
+        if src == _ETORO_CRYPTO_PRICE_SOURCE:
             return True
+        # Symbol fallback for stale snapshots / search payloads that
+        # don't include priceSource. Keep this list narrow so we don't
+        # accidentally mis-tag a stock like ADAP (Adaptimmune) as ADA.
         sym = (self.symbol_full or "").upper()
-        return sym in {"BTC", "ETH", "SOL", "ADA", "DOGE", "XRP"}
+        return sym in {"BTC", "ETH", "SOL", "DOGE", "XRP", "LTC", "BCH"}
 
 
 def _instrument_from(raw: dict[str, Any]) -> InstrumentMeta:

@@ -362,6 +362,7 @@ def format_help() -> str:
         "  /panic_bot_only    close only bot-owned positions and pause\n"
         "  /ask <question>    ask the LLM about the bot's state\n"
         "  /alerts            toggle which Telegram alerts you receive\n"
+        "  /stats [view]      performance dashboard (menu, or e.g. /stats today)\n"
         "  /help              this message\n"
         "\n"
         "Anything that's not a command is treated as /ask <text>."

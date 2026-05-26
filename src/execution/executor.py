@@ -38,6 +38,7 @@ from ..etoro.trading import (
 )
 from ..state import BotState
 from ..strategy.risk import TradeVerdict, compute_stop_loss_take_profit
+from .dynamic_stops import DynamicStopsStore
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class TradeExecutor:
         guardrails: GuardrailsConfig,
         operations: OperationsConfig,
         logger: logging.Logger | logging.LoggerAdapter | None = None,
+        dynamic_stops: DynamicStopsStore | None = None,
     ) -> None:
         if env not in {"demo", "real"}:
             raise ValueError(f"env must be 'demo' or 'real', got {env!r}")
@@ -69,6 +71,7 @@ class TradeExecutor:
         self._guardrails = guardrails
         self._operations = operations
         self._logger = logger or logging.getLogger("etrader.execution.executor")
+        self._dynamic_stops = dynamic_stops
 
     def execute_all(
         self,
@@ -98,6 +101,16 @@ class TradeExecutor:
                 results.append(self._open(v, rates, state))
             elif v.request.action == "CLOSE":
                 results.append(self._close(v, state))
+            elif v.request.action == "MODIFY_STOPS":
+                results.append(self._modify_stops(v))
+            else:
+                results.append(ExecutionResult(
+                    request_symbol=v.request.symbol,
+                    action=v.request.action,
+                    status="skipped",
+                    instrument_id=v.request.instrument_id,
+                    detail=f"unsupported action {v.request.action!r}",
+                ))
         return results
 
     # ------------------------------------------------------------------
@@ -175,7 +188,14 @@ class TradeExecutor:
         if req.position_id is None:
             return ExecutionResult(req.symbol, "CLOSE", "failed", detail="missing position_id")
 
-        self._logger.info("[exec] CLOSE %s positionID=%d", req.symbol, req.position_id)
+        units_to_deduct = self._compute_units_to_deduct(req, state)
+        partial = units_to_deduct is not None
+        self._logger.info(
+            "[exec] CLOSE%s %s positionID=%d%s",
+            " (partial)" if partial else "",
+            req.symbol, req.position_id,
+            f"  units_to_deduct={units_to_deduct:.6f}" if partial else "",
+        )
 
         try:
             response = close_position_by_market(
@@ -183,6 +203,7 @@ class TradeExecutor:
                 env=self._env,
                 position_id=req.position_id,
                 instrument_id=req.instrument_id,
+                units_to_deduct=units_to_deduct,
             )
         except EtoroAuthError as exc:
             self._logger.error("[exec] AUTH error closing %s: %s", req.symbol, exc)
@@ -201,7 +222,13 @@ class TradeExecutor:
         order_id = order_for_close.get("orderID") or order_for_close.get("orderId")
         state.mark_action(req.instrument_id)
         state.record_bot_action()
-        state.remove_owned(req.position_id)
+        if units_to_deduct is None:
+            # Full close — position is gone from the broker.
+            state.remove_owned(req.position_id)
+            if self._dynamic_stops is not None:
+                self._dynamic_stops.clear(req.position_id)
+        # Partial close: keep the position_id in state since the broker
+        # still has the remainder open.
         return ExecutionResult(
             request_symbol=req.symbol,
             action="CLOSE",
@@ -209,5 +236,79 @@ class TradeExecutor:
             order_id=int(order_id) if order_id else None,
             position_id=req.position_id,
             instrument_id=req.instrument_id,
-            detail=f"orderID={order_id}",
+            detail=(
+                f"orderID={order_id}, units_to_deduct={units_to_deduct:.6f}"
+                if units_to_deduct is not None
+                else f"orderID={order_id}"
+            ),
+        )
+
+    def _compute_units_to_deduct(
+        self, req, state: BotState,
+    ) -> float | None:
+        """Return ``UnitsToDeduct`` for a partial close, or ``None`` for full.
+
+        The cycle layer resolves ``close_fraction`` against the live
+        position's ``units`` and stuffs the absolute units into
+        :attr:`TradeRequest.close_units` before the executor sees it.
+        If neither is set (or both signal "full"), we full-close.
+        """
+        if req.close_units is not None and float(req.close_units) > 0.0:
+            return float(req.close_units)
+        # Fraction without resolved units → fall back to full close. The
+        # cycle layer is responsible for the resolution; we don't want
+        # to silently degrade to "close everything" when the caller
+        # asked for partial, so we log a warning.
+        if req.close_fraction is not None and float(req.close_fraction) < 1.0:
+            self._logger.warning(
+                "[exec] CLOSE %s partial requested (frac=%.3f) but "
+                "close_units not resolved; full-closing.",
+                req.symbol, float(req.close_fraction),
+            )
+        return None
+
+    def _modify_stops(self, verdict: TradeVerdict) -> ExecutionResult:
+        """Apply the LLM's MODIFY_STOPS to the dynamic-stops store.
+
+        eToro's Public API does not expose a modify-position endpoint;
+        the bot enforces SL/TP client-side via the position monitor.
+        This action therefore never round-trips to the broker — it
+        only updates the in-memory store the monitor reads from.
+        """
+        req = verdict.request
+        if self._dynamic_stops is None:
+            return ExecutionResult(
+                request_symbol=req.symbol,
+                action="MODIFY_STOPS",
+                status="skipped",
+                instrument_id=req.instrument_id,
+                position_id=req.position_id,
+                detail="dynamic-stops store not wired",
+            )
+        assert req.position_id is not None  # risk evaluator guarantees
+        band = self._dynamic_stops.set_band(
+            req.position_id,
+            stop_loss_pct=req.stop_loss_pct,
+            take_profit_pct=req.take_profit_pct,
+            trailing_stop_pct=req.trailing_stop_pct,
+            rationale=req.rationale,
+        )
+        detail = (
+            f"SL={band.stop_loss_pct:.2f}% TP={band.take_profit_pct:.2f}%"
+            + (
+                f" trail={band.trailing_stop_pct:.2f}%"
+                if band.trailing_stop_pct is not None else ""
+            )
+        )
+        self._logger.info(
+            "[exec] MODIFY_STOPS %s positionID=%d  %s",
+            req.symbol, req.position_id, detail,
+        )
+        return ExecutionResult(
+            request_symbol=req.symbol,
+            action="MODIFY_STOPS",
+            status="ok",
+            instrument_id=req.instrument_id,
+            position_id=req.position_id,
+            detail=detail,
         )

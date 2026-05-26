@@ -40,30 +40,62 @@ class AssetClass(str, Enum):
     OTHER = "other"
 
 
-# eToro instrumentTypeID mapping (best-effort; these are stable enough to ship):
-# 1 = stock, 4 = ETF, 5 = crypto, 6 = currency/FX, 8 = index, 10 = commodity.
+# Empirical eToro mapping from live ``/market-data/instruments`` probes
+# (11 stocks + crypto, verified 2026-05-26). The docs claim 1=stock,
+# 5=crypto, 10=commodity but the live API returns ``instrumentTypeID=5``
+# for cash equities like AMD/JPM/AVGO/LUNR and ``instrumentTypeID=10``
+# for crypto (BTC/BCH/XRPAUD). We treat the type ID as a HINT and
+# disambiguate using ``priceSource`` + ``stocksIndustryID``.
 _TYPE_ID_TO_CLASS: dict[int, AssetClass] = {
-    1: AssetClass.STOCK,
-    4: AssetClass.ETF,
-    5: AssetClass.CRYPTO,
+    5: AssetClass.STOCK,        # observed empirically — typeID=5 is STOCK, not crypto
     6: AssetClass.FX,
-    8: AssetClass.INDEX,
-    10: AssetClass.COMMODITY,
+    10: AssetClass.CRYPTO,      # observed empirically — typeID=10 is CRYPTO, not commodity
 }
 
-_KNOWN_CRYPTO = {"BTC", "ETH", "SOL", "ADA", "DOGE", "XRP", "LTC", "MATIC", "DOT", "BNB"}
+# Known equity-exchange ``priceSource`` strings (case-insensitive). When
+# the meta reports any of these as priceSource the instrument is a
+# cash equity (or ETF) regardless of what instrumentTypeID says.
+_EQUITY_PRICE_SOURCES = {
+    "nasdaq", "nyse", "amex", "arca", "bats", "lse", "tsx", "tsxv",
+    "hkex", "sse", "szse", "asx", "tse", "fwb", "xetra", "swx", "borsa",
+    "euronext", "milan", "madrid",
+}
+
+_KNOWN_CRYPTO = {"BTC", "ETH", "SOL", "DOGE", "XRP", "LTC", "BCH"}
 _KNOWN_INDEX = {"SPX500", "NSDQ100", "DJ30", "RUSS2000", "DAX30", "UK100", "JPN225"}
 
 
 def asset_class_for(meta: InstrumentMeta | None, *, symbol: str | None = None) -> AssetClass:
     """Return the asset class for an instrument, with safe fallbacks.
 
-    Used by the selector to decide which tools make sense; e.g. FX
+    Used by the selector to decide which tools make sense (e.g. FX
     instruments don't have meaningful candle volume on eToro, so
-    volume tools are auto-disabled for them.
+    volume tools are auto-disabled for them) and by the
+    market-hours gate to know whether a name is 24/7-tradable.
+
+    Resolution order (most authoritative first):
+
+    1. ``priceSource = "eToro"`` → CRYPTO. eToro hosts crypto in
+       its in-house book; this is the cleanest crypto signal.
+    2. ``priceSource`` matches a known equity exchange → STOCK.
+    3. ``stocksIndustryID`` is present and > 0 → STOCK. The crypto
+       payload either omits this field or sets it to 0.
+    4. ``instrumentTypeID`` lookup against the empirical map.
+    5. Symbol-based fallback (BTC/ETH/SPX500/...).
+    6. ``AssetClass.OTHER``.
     """
-    if meta is not None and meta.instrument_type_id in _TYPE_ID_TO_CLASS:
-        return _TYPE_ID_TO_CLASS[int(meta.instrument_type_id)]
+    if meta is not None:
+        src = (meta.price_source or "").strip().lower()
+        if src == "etoro":
+            return AssetClass.CRYPTO
+        if src in _EQUITY_PRICE_SOURCES:
+            return AssetClass.STOCK
+        sid = meta.stocks_industry_id
+        if sid is not None and sid > 0:
+            return AssetClass.STOCK
+        tid = meta.instrument_type_id
+        if tid is not None and int(tid) in _TYPE_ID_TO_CLASS:
+            return _TYPE_ID_TO_CLASS[int(tid)]
     sym = (symbol or (meta.symbol_full if meta else None) or "").upper()
     if sym in _KNOWN_CRYPTO:
         return AssetClass.CRYPTO

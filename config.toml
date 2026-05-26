@@ -23,11 +23,38 @@ trading = "paper"
 [guardrails]
 max_per_trade_usd          = 500.0   # max cash committed per single open
 max_parallel_trades        = 10      # max simultaneous open positions opened by this bot
+# Total USD the bot may have invested across ALL of its own open
+# positions at any one time. Counts only bot-owned positions — manual
+# / mirror positions are ignored. 0 disables the cap. When a new BUY
+# would push the bot over the cap, the risk layer first tries to
+# amend the BUY down to whatever headroom is left; if the headroom
+# is below `min_amend_remainder_usd`, the BUY is rejected entirely.
+max_bot_invested_usd       = 2000.0
+min_amend_remainder_usd    = 50.0    # floor under which budget-amended BUYs are rejected, not shrunk further
 daily_loss_stop_usd        = 250.0   # halt new opens for the day if equity drops by ≥ this vs. session start
 per_instrument_cooldown_min = 60     # after closing/opening on an instrument, ignore it for N minutes
 default_stop_loss_pct      = 5.0     # SL distance from entry (% of entry price)
 default_take_profit_pct    = 8.0     # TP distance from entry (% of entry price)
 max_leverage               = 1       # default leverage; the bot never sends > 1 unless this is raised
+
+# ---------------------------------------------------------------------
+# [position_review] threshold-triggered review of open bot positions
+# ---------------------------------------------------------------------
+# Every cycle the bot pre-screens each of its own open positions
+# against these triggers. A position that fires ≥1 trigger gets a
+# `review.triggers` annotation in the LLM payload, and the manager
+# is REQUIRED to respond with CLOSE (full or partial), MODIFY_STOPS
+# (tighten / loosen SL/TP, possibly add a trailing band), or HOLD with
+# an explicit rationale.
+#
+# Set any value to 0 to disable that trigger. All percentages are
+# positive numbers (5.0 = 5%).
+[position_review]
+drawdown_pct           = 2.0    # close-or-explain when P/L ≤ -X% of entry
+pullback_pct           = 3.0    # close-or-explain when position gave back ≥ X% of peak P/L
+stale_hold_minutes     = 60.0   # consider a position "stale" after this long
+stale_threshold_pct    = 0.5    # …if |P/L| < this % when the stale timer expires
+max_hold_minutes       = 240.0  # hard ceiling on how long the bot may hold any single position
 
 # ---------------------------------------------------------------------
 # [operations] cycle timing + market-data shape

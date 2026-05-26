@@ -25,8 +25,9 @@ from .alerts_menu import (
     is_alerts_callback,
     parse_alerts_callback,
 )
-from .commands import CommandContext, dispatch, parse_command
+from .commands import CommandContext, dispatch, parse_command, render_stats_view
 from .control_client import ControlAPIClient, ControlAPIError
+from .stats_menu import is_stats_callback, parse_stats_callback
 from .telegram_api import (
     IncomingCallback,
     IncomingMessage,
@@ -138,6 +139,9 @@ class TelegramService:
             self.telegram.answer_callback(cb.callback_id, text="Not allowed.")
             return
 
+        if is_stats_callback(cb.data):
+            self._handle_stats_callback(cb)
+            return
         if not is_alerts_callback(cb.data):
             self.logger.info(
                 "ignoring unknown callback data=%r from chat=%d",
@@ -153,6 +157,30 @@ class TelegramService:
             self._handle_alerts_close(cb)
         else:
             self.telegram.answer_callback(cb.callback_id, text="Unknown action.")
+
+    def _handle_stats_callback(self, cb: IncomingCallback) -> None:
+        """Render a /stats view in a fresh message when a button is tapped."""
+        parsed = parse_stats_callback(cb.data)
+        if parsed.action == "close":
+            try:
+                self.telegram.edit_reply_markup(cb.chat_id, cb.message_id, None)
+            except TelegramApiError as exc:
+                self.logger.warning("stats close edit_reply_markup failed: %s", exc)
+            self.telegram.answer_callback(cb.callback_id, text="Closed.")
+            return
+        if parsed.action != "view":
+            self.telegram.answer_callback(cb.callback_id, text="Unknown action.")
+            return
+        try:
+            text = render_stats_view(self.api, parsed.view_id)
+        except ControlAPIError as exc:
+            self.logger.warning("stats render failed: %s", exc)
+            text = f"Control API error: {exc}"
+        try:
+            self.telegram.send_message(cb.chat_id, text)
+        except TelegramApiError as exc:
+            self.logger.warning("stats send failed: %s", exc)
+        self.telegram.answer_callback(cb.callback_id, text=parsed.view_id)
 
     def _handle_alerts_toggle(self, cb: IncomingCallback, *, type_str: str) -> None:
         try:

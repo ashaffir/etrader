@@ -127,6 +127,34 @@ def _strategy_signals(c: BotController, _body, _q) -> tuple[int, Any]:
     return 200, c.snapshot_strategy_rules()
 
 
+def _stats_summary(c: BotController, _body, _q) -> tuple[int, Any]:
+    """``GET /stats`` — overview payload (multi-window + open positions)."""
+    return 200, c.snapshot_performance()
+
+
+def _stats_by_symbol(c: BotController, _body, _q) -> tuple[int, Any]:
+    """``GET /stats/by-symbol`` — per-symbol rollup."""
+    return 200, c.snapshot_performance_symbols()
+
+
+def _stats_closed(c: BotController, _body, q: Mapping[str, str]) -> tuple[int, Any]:
+    """``GET /stats/closed?limit=N`` — most-recent closed trades."""
+    try:
+        limit = int(q.get("limit") or "50")
+    except ValueError:
+        limit = 50
+    return 200, c.snapshot_performance_closed_trades(limit=limit)
+
+
+def _stats_daily(c: BotController, _body, q: Mapping[str, str]) -> tuple[int, Any]:
+    """``GET /stats/daily?limit=N`` — daily snapshots."""
+    try:
+        limit = int(q.get("limit") or "30")
+    except ValueError:
+        limit = 30
+    return 200, c.snapshot_performance_dailies(limit=limit)
+
+
 def _news_channels(c: BotController, _body, _q) -> tuple[int, Any]:
     """``GET /news/channels`` — per-source health overview."""
     return 200, c.snapshot_news_channels()
@@ -240,6 +268,10 @@ def build_route_table() -> RouteTable:
     rt.add("POST", "/ask", _ask)
     rt.add("POST", "/shutdown", _shutdown)
     rt.add("GET", "/strategy/signals", _strategy_signals)
+    rt.add("GET", "/stats", _stats_summary)
+    rt.add("GET", "/stats/by-symbol", _stats_by_symbol)
+    rt.add("GET", "/stats/closed", _stats_closed)
+    rt.add("GET", "/stats/daily", _stats_daily)
     rt.add("GET", "/news/channels", _news_channels)
     rt.add("POST", "/news/channels/test", _news_channels_test)
     rt.add("GET", "/alerts/types", _alerts_types)

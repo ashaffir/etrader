@@ -39,6 +39,15 @@ from .formatters import (
     format_status,
     format_universe,
 )
+from .stats_formatter import (
+    format_by_symbol as format_stats_by_symbol,
+    format_closed as format_stats_closed,
+    format_daily as format_stats_daily,
+    format_open as format_stats_open,
+    format_overview as format_stats_overview,
+    format_window as format_stats_window,
+)
+from .stats_menu import build_stats_caption, build_stats_keyboard
 
 
 @dataclass(frozen=True)
@@ -242,6 +251,67 @@ def _h_alerts(ctx: CommandContext) -> CommandReply:
     )
 
 
+def _h_stats(ctx: CommandContext) -> CommandReply:
+    """``/stats [view]`` — performance dashboard.
+
+    Without args, presents an inline keyboard menu with the views
+    (Overview / Today / 7d / 30d / All-time / Open / Closed / By
+    Symbol / Daily). With an arg, jumps straight to that view (so
+    power users can type ``/stats today`` etc.). Valid args match
+    :data:`stats_menu.STATS_VIEWS` keys plus their natural aliases.
+    """
+    arg = (ctx.cmd.args or "").strip().lower()
+    if not arg:
+        return CommandReply(
+            text=build_stats_caption(),
+            reply_markup=build_stats_keyboard(),
+        )
+    view = _resolve_stats_view_alias(arg)
+    if view is None:
+        return CommandReply(
+            text=(
+                "Unknown /stats view. Valid: overview, today, 7d, 30d, all, "
+                "open, closed, by-symbol, daily."
+            ),
+            reply_markup=build_stats_keyboard(),
+        )
+    return CommandReply(text=render_stats_view(ctx.api, view))
+
+
+_STATS_VIEW_ALIASES: dict[str, str] = {
+    "overview": "overview", "summary": "overview",
+    "today": "today", "now": "today",
+    "7d": "7d", "week": "7d", "7days": "7d",
+    "30d": "30d", "month": "30d", "30days": "30d",
+    "all": "all", "all-time": "all", "alltime": "all", "lifetime": "all",
+    "open": "open", "open-positions": "open", "positions": "open",
+    "closed": "closed", "trades": "closed", "history": "closed",
+    "by-symbol": "by_symbol", "by_symbol": "by_symbol", "symbols": "by_symbol", "symbol": "by_symbol",
+    "daily": "daily", "days": "daily",
+}
+
+
+def _resolve_stats_view_alias(arg: str) -> str | None:
+    return _STATS_VIEW_ALIASES.get(arg.replace(" ", ""))
+
+
+def render_stats_view(api: ControlAPIClient, view: str) -> str:
+    """Fetch + format one stats view. Exported so the callback layer can reuse."""
+    if view == "overview":
+        return format_stats_overview(api.stats_summary())
+    if view in ("today", "7d", "30d", "all"):
+        return format_stats_window(api.stats_summary(), period=view)
+    if view == "open":
+        return format_stats_open(api.stats_summary())
+    if view == "closed":
+        return format_stats_closed(api.stats_closed(limit=50))
+    if view == "by_symbol":
+        return format_stats_by_symbol(api.stats_by_symbol())
+    if view == "daily":
+        return format_stats_daily(api.stats_daily(limit=30))
+    return f"Unknown view: {view}"
+
+
 def _unknown(ctx: CommandContext) -> str:
     return (
         f"Unknown command /{ctx.cmd.name}.\n\n"
@@ -277,4 +347,7 @@ _COMMANDS: dict[str, CommandHandler] = {
     "ask": _h_ask,
     "alerts": _h_alerts,
     "subscriptions": _h_alerts,  # alias
+    "stats": _h_stats,
+    "performance": _h_stats,     # alias
+    "perf": _h_stats,            # alias
 }

@@ -81,6 +81,18 @@ class GuardrailsConfig:
     default_stop_loss_pct: float = 5.0
     default_take_profit_pct: float = 8.0
     max_leverage: int = 1
+    # Maximum total USD the BOT may have deployed across all of its
+    # own open positions at any time. Set to 0 to disable. Counts
+    # only bot-owned positions — your manual / mirror positions are
+    # ignored. The risk layer either amends a BUY down to whatever
+    # headroom is left (when the remainder is at least
+    # ``min_amend_remainder_usd``) or rejects it outright.
+    max_bot_invested_usd: float = 2000.0
+    # Floor for amend-down behaviour. When the budget headroom is
+    # smaller than this, the BUY is rejected entirely rather than
+    # amended to a token amount. Prevents the bot from posting
+    # uselessly tiny trades (e.g. $3 that the broker would reject).
+    min_amend_remainder_usd: float = 50.0
 
 
 @dataclass(frozen=True)
@@ -396,6 +408,20 @@ class TelegramConfig:
 
 
 @dataclass(frozen=True)
+class PositionReviewConfigDC:
+    """Thresholds that drive the per-cycle position review (see
+    :mod:`src.strategy.position_review`). All percentages are positive;
+    setting any value to 0 disables the corresponding trigger.
+    """
+
+    drawdown_pct: float = 2.0
+    pullback_pct: float = 3.0
+    stale_hold_minutes: float = 60.0
+    stale_threshold_pct: float = 0.5
+    max_hold_minutes: float = 240.0
+
+
+@dataclass(frozen=True)
 class AppConfig:
     trading_mode: str  # "paper" | "live"
     guardrails: GuardrailsConfig
@@ -411,6 +437,7 @@ class AppConfig:
     azure: AzureCredentials
     control: ControlServiceConfig
     alerting: AlertingConfig
+    position_review: PositionReviewConfigDC = PositionReviewConfigDC()
 
     @property
     def is_paper(self) -> bool:
@@ -561,18 +588,24 @@ def load_config(
         logging_cfg = _build_section(
             LoggingConfig, toml=raw.get("logging"), db=store.get_section("logging"),
         )
+        position_review = _build_section(
+            PositionReviewConfigDC,
+            toml=raw.get("position_review"),
+            db=store.get_section("position_review"),
+        )
 
         if snapshot_on_first_run:
             merged_sections = {
-                "guardrails":   _section_to_dict(guardrails),
-                "operations":   _section_to_dict(operations),
-                "universe":     _section_to_dict(universe),
-                "news":         _section_to_dict(news),
-                "fundamentals": _section_to_dict(fundamentals),
-                "strategy":     _section_to_dict(strategy),
-                "ai":           _section_to_dict(ai),
-                "tools":        _section_to_dict(tools),
-                "logging":      _section_to_dict(logging_cfg),
+                "guardrails":      _section_to_dict(guardrails),
+                "operations":      _section_to_dict(operations),
+                "universe":        _section_to_dict(universe),
+                "news":            _section_to_dict(news),
+                "fundamentals":    _section_to_dict(fundamentals),
+                "strategy":        _section_to_dict(strategy),
+                "ai":              _section_to_dict(ai),
+                "tools":           _section_to_dict(tools),
+                "logging":         _section_to_dict(logging_cfg),
+                "position_review": _section_to_dict(position_review),
             }
             store.snapshot_if_empty(merged_sections)
             # On second+ runs: pick up newly-added sections (e.g.
@@ -658,6 +691,7 @@ def load_config(
         azure=azure,
         control=control,
         alerting=alerting,
+        position_review=position_review,
     )
 
 

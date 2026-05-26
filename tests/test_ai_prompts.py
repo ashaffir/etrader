@@ -51,15 +51,64 @@ class QaPromptModeAgnosticTests(unittest.TestCase):
         for tool in ("sma cross", "ema cross", "macd", "bollinger", "donchian"):
             self.assertIn(tool, s, msg=f"prompt does not name {tool!r}")
 
-    def test_qa_user_payload_includes_snapshot_verbatim(self) -> None:
+    def test_qa_user_payload_includes_snapshot_fields(self) -> None:
+        """The bot_state is allowed to be augmented (partitioned positions,
+        counts) but the original keys must survive verbatim."""
         snapshot = {"trading_mode": "paper", "cycle_count": 97, "halted_today": False}
         _system, user = build_qa_prompt(
             question="status?",
             bot_snapshot=snapshot,
         )
         payload = json.loads(user)
-        self.assertEqual(payload["bot_state"], snapshot)
+        for k, v in snapshot.items():
+            self.assertEqual(payload["bot_state"][k], v)
         self.assertEqual(payload["question"], "status?")
+
+    def test_qa_payload_partitions_bot_owned_from_manual(self) -> None:
+        """Real-world hallucination guard: when the user has 10 positions
+        but only 1 is bot-owned, the LLM payload must clearly separate them
+        instead of mashing all 10 into a single ``portfolio_positions``."""
+        snapshot = {
+            "bot_owned_position_ids": [9001],
+            "portfolio_positions": [
+                {"position_id": 9001, "symbol": "AAPL", "amount": 500.0},
+                {"position_id": 9002, "symbol": "MSFT", "amount": 300.0},  # manual
+                {"position_id": 9003, "symbol": "TSLA", "amount": 400.0},  # manual
+            ],
+        }
+        _system, user = build_qa_prompt(question="how am I doing?", bot_snapshot=snapshot)
+        payload = json.loads(user)
+        state = payload["bot_state"]
+        self.assertEqual(len(state["bot_owned_positions"]), 1)
+        self.assertEqual(state["bot_owned_positions"][0]["symbol"], "AAPL")
+        self.assertEqual(len(state["manual_or_mirror_positions"]), 2)
+        self.assertEqual(state["counts"]["bot_owned"], 1)
+        self.assertEqual(state["counts"]["manual_or_mirror"], 2)
+        self.assertEqual(state["counts"]["total_on_account"], 3)
+        # The ambiguous original key must be cleared so the LLM can't
+        # accidentally pick it up.
+        self.assertEqual(state["portfolio_positions"], [])
+
+    def test_qa_system_documents_position_partitioning(self) -> None:
+        """The new bot_owned vs manual_or_mirror invariant must be locked in
+        the system prompt so a future contributor can't silently remove it."""
+        system, _user = build_qa_prompt(question="?", bot_snapshot={})
+        s = system.lower()
+        self.assertIn("bot_owned_positions", system)
+        self.assertIn("manual_or_mirror_positions", system)
+        self.assertIn("bot-attributable", s)
+
+    def test_qa_payload_includes_performance_when_supplied(self) -> None:
+        """The performance block is the LLM's authoritative source of bot
+        P/L numbers; it must round-trip into the payload unchanged."""
+        perf = {"bot": {"unrealized_pnl": -12.34, "trades_today": 3}, "account": {"unrealized_pnl": -5.91}}
+        _system, user = build_qa_prompt(
+            question="how is the bot doing?",
+            bot_snapshot={},
+            performance=perf,
+        )
+        payload = json.loads(user)
+        self.assertEqual(payload["performance"], perf)
 
     def test_decision_prompt_does_not_leak_mode(self) -> None:
         """Decision-call prompt must not include a paper/live signal —
@@ -74,6 +123,55 @@ class QaPromptModeAgnosticTests(unittest.TestCase):
         for forbidden in ("paper", "demo", "live", "simulated", "for practice"):
             self.assertNotIn(forbidden, haystack,
                              f"decision prompt unexpectedly contains {forbidden!r}")
+
+
+class DecisionPromptDynamicManagementTests(unittest.TestCase):
+    """The decision prompt must teach the LLM about MODIFY_STOPS,
+    partial close, the review.triggers loop, and the by_symbol
+    track-record signal. Regression coverage for the dynamic
+    position-management surface."""
+
+    def test_system_prompt_documents_modify_stops_action(self) -> None:
+        system, _ = build_decision_prompt(
+            portfolio_summary={}, bot_owned_positions=[], candidates=[],
+            guardrails_summary={},
+        )
+        self.assertIn("MODIFY_STOPS", system)
+        self.assertIn("trailing_stop_pct", system)
+        self.assertIn("close_fraction", system)
+
+    def test_system_prompt_documents_review_triggers(self) -> None:
+        system, _ = build_decision_prompt(
+            portfolio_summary={}, bot_owned_positions=[], candidates=[],
+            guardrails_summary={},
+        )
+        self.assertIn("review.triggers", system)
+        self.assertIn("mfe_usd", system)
+        self.assertIn("by_symbol", system.lower())
+
+    def test_performance_payload_round_trips(self) -> None:
+        perf = {
+            "bot": {"unrealized_pnl_usd": 5.0, "trades_total": 10},
+            "by_symbol": {"AAPL": {"trades": 3, "win_rate": 0.667}},
+            "position_reviews": [
+                {"position_id": 1, "triggers": ["drawdown"]},
+            ],
+        }
+        _, user = build_decision_prompt(
+            portfolio_summary={}, bot_owned_positions=[], candidates=[],
+            guardrails_summary={},
+            performance=perf,
+        )
+        payload = json.loads(user)
+        self.assertEqual(payload["performance"], perf)
+
+    def test_omits_performance_when_unset(self) -> None:
+        _, user = build_decision_prompt(
+            portfolio_summary={}, bot_owned_positions=[], candidates=[],
+            guardrails_summary={},
+        )
+        payload = json.loads(user)
+        self.assertIsNone(payload["performance"])
 
 
 if __name__ == "__main__":

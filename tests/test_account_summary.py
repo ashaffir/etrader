@@ -98,6 +98,33 @@ class AccountSummaryFormulaTests(unittest.TestCase):
         # Equity = AC + TI + PnL
         self.assertAlmostEqual(s["equity"], 9_750.0 + 1_751.0 + 20.0, places=2)
 
+    def test_pnl_falls_back_to_top_level_when_positions_report_zero(self) -> None:
+        """Live observation: eToro returns per-position pnL=0 for many account
+        compositions (e.g. unleveraged cash equities) while the rolled-up
+        ``unrealizedPnL`` carries the truth. The old summary summed the
+        per-position fields and silently reported $0.00 P/L when the account
+        was actually down. This test pins the fix in place."""
+        payload = {
+            "clientPortfolio": {
+                "credit": 100_000.0,
+                "unrealizedPnL": -5.91,      # the real, rolled-up loss
+                "positions": [
+                    {"positionID": 1, "instrumentID": 100, "isBuy": True,
+                     "openRate": 100.0, "amount": 500.0, "units": 5.0,
+                     "leverage": 1, "mirrorID": 0, "pnL": 0.0},
+                    {"positionID": 2, "instrumentID": 200, "isBuy": True,
+                     "openRate": 50.0, "amount": 500.0, "units": 10.0,
+                     "leverage": 1, "mirrorID": 0, "pnL": 0.0},
+                ],
+                "ordersForOpen": [],
+                "orders": [],
+                "mirrors": [],
+            }
+        }
+        snap = fetch_portfolio(_ClientStub(payload), "demo")
+        s = compute_account_summary(snap)
+        self.assertAlmostEqual(s["profit_loss"], -5.91, places=2)
+
     def test_handles_lowercamel_payload(self) -> None:
         # Same logical state, lowerCamel keys (matches the OpenAPI example).
         payload = {

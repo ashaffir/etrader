@@ -115,6 +115,22 @@ class ControlAPIClient:
     def strategy_signals(self) -> dict[str, Any]:
         return self._request("GET", "/strategy/signals")
 
+    # -- /stats endpoints ---------------------------------------------
+
+    def stats_summary(self) -> dict[str, Any]:
+        return self._request("GET", "/stats")
+
+    def stats_by_symbol(self) -> dict[str, Any]:
+        return self._request("GET", "/stats/by-symbol")
+
+    def stats_closed(self, *, limit: int = 50) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 200))
+        return self._request("GET", f"/stats/closed?limit={limit}")
+
+    def stats_daily(self, *, limit: int = 30) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 365))
+        return self._request("GET", f"/stats/daily?limit={limit}")
+
     def news_channels(self) -> dict[str, Any]:
         return self._request("GET", "/news/channels")
 

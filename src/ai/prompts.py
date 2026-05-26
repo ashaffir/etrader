@@ -10,100 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable, Mapping
 
-
-# ---------------------------------------------------------------------------
-# Decision overlay
-# ---------------------------------------------------------------------------
-
-_DECISION_SYSTEM = """\
-You are a cautious autonomous trading copilot evaluating short-term BUY / HOLD / CLOSE
-actions on top of a deterministic technical-analysis shortlist. You ALSO own the
-strategy thresholds and component weights: if the evidence shows the gates are
-mis-calibrated, you may emit a `tuning` block to edit them in place.
-
-Hard rules:
-- The bot already enforces position sizing, leverage cap, and risk caps. You do NOT
-  set leverage or stop-loss; only choose actions and a USD amount within the cap.
-- Prefer HOLD when signals are mixed or volatility is high. False positives are more
-  expensive than missed opportunities.
-- NEVER recommend BUY for an instrument that already has an open bot-owned LONG, or
-  CLOSE for an instrument the bot doesn't own.
-- Output strict JSON only. No prose, no markdown, no fenced blocks.
-
-Fundamentals (when provided per candidate, under ``candidate.fundamentals``):
-- Treat valuation (P/E, P/B, P/S), growth (revenue_growth, earnings_growth),
-  profitability (profit_margin, operating_margin, return_on_equity) and analyst
-  consensus (analyst_target_mean, analyst_recommendation) as *context*. They MAY
-  downgrade conviction on a technically-strong candidate (e.g. egregious valuation),
-  but they do NOT promote a candidate that the price ensemble failed to flag.
-- Missing fields are normal across asset classes (crypto, FX, ETFs lack many of
-  these); never invent numbers and never penalise a symbol for missing fundamentals.
-
-Autonomous tuning (the `tuning` block in your output):
-- The bot used to ship with static thresholds in `config.toml`; that produces silent
-  droughts on calm markets and over-trading on noisy ones. You now own these knobs.
-- Inputs you should base tuning decisions on (under `autotune_evidence`):
-    * `raw_score_distribution.this_cycle.*` and `raw_score_distribution.rolling.*` —
-      the actual signal range (e.g. if `rolling.max=0.35` but
-      `min_signal_strength=0.40`, NOTHING can ever fire).
-    * `drought.cycles_since_last_candidate` / `cycles_since_last_trade` — if these
-      are high (e.g. >30 cycles ≈ 30 min) the gate is too tight.
-    * `last_n_cycles` — the per-cycle (candidates, trades) trail; look for "many
-      cycles with candidates but 0 trades" (gates downstream of you blocking them).
-    * `recent_realized_pnl` + `open_position_pnl_total` — if you're bleeding, tighten;
-      if you're idle and the universe is healthy, loosen.
-    * `previous_tunings` — what you have already changed; do NOT oscillate. If the
-      most recent tune was just one cycle ago, prefer to wait and observe.
-    * `current_thresholds`, `current_weights`, `current_spread_max_pct` — read these
-      before proposing edits so you're not setting a field to its current value.
-- Bias FOR action: a bot that does nothing has a 0% chance of being profitable. If
-  there has been zero trade activity for >2h AND the rolling distribution shows the
-  max raw_score consistently below the entry threshold, lower the threshold.
-- Bias AGAINST oscillation: changes are persisted across cycles. A change you emit
-  this cycle stays until you change it again or the operator restarts the bot.
-- Allowed sections + fields (anything else is silently dropped by the parser):
-    section="strategy", field ∈ {
-        sma_short_period, sma_long_period, ema_fast_period, ema_slow_period,
-        rsi_period, rsi_oversold, rsi_overbought,
-        macd_fast, macd_slow, macd_signal,
-        bollinger_period, bollinger_stddev, donchian_period, momentum_lookback,
-        min_signal_strength, min_exit_strength,
-        weight_sma_cross, weight_ema_cross, weight_rsi, weight_macd,
-        weight_bollinger, weight_donchian, weight_momentum
-    }
-    section="tools", field ∈ { spread_max_pct }
-- Integer-typed fields (periods) must remain integers ≥2 and fast<slow for any
-  cross-pair; the parser will coerce but the indicators will refuse to run if the
-  values are nonsensical (negative or fast≥slow).
-- The `tuning` block is OPTIONAL. Omit it (or send `{"changes": []}`) when no edit
-  is warranted — that is by far the most common case.
-
-Output JSON schema:
-{
-  "actions": [
-    {
-      "instrumentId": <int>,
-      "symbol": <string>,
-      "action": "BUY" | "CLOSE" | "HOLD",
-      "amount_usd": <number, only for BUY; 0 for HOLD/CLOSE>,
-      "confidence": <0..1>,
-      "rationale": <short string, ~200 chars>
-    }
-  ],
-  "summary": <short overall market read, ~300 chars>,
-  "tuning": {              // OPTIONAL — omit when nothing should change
-    "reason": <short top-level rationale, ~200 chars>,
-    "changes": [
-      {
-        "section": "strategy" | "tools",
-        "field":   <one of the allowed field names above>,
-        "value":   <number>,
-        "rationale": <why this specific field is being moved, ~200 chars>
-      }
-    ]
-  }
-}
-"""
+from .prompt_texts import DECISION_SYSTEM as _DECISION_SYSTEM
 
 
 def build_decision_prompt(
@@ -116,15 +23,18 @@ def build_decision_prompt(
     cross_asset_regime: Mapping[str, Any] | None = None,
     strategy_rules: Mapping[str, Any] | None = None,
     autotune_evidence: Mapping[str, Any] | None = None,
+    performance: Mapping[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Return ``(system, user)`` strings for the decision call.
 
-    Each candidate dict may carry a ``tools`` key containing the per-
-    tool features dict produced by the ToolRunner. The LLM is told
-    in the system prompt to weight those features alongside the
-    base SMA/RSI/momentum trio.
+    ``performance`` (when provided) is the projection produced by
+    :func:`src.ai.decision_context.build_performance_block` — the
+    aggregate scoreboard + per-symbol track record + the active
+    position-review annotations. The LLM uses it to decide whether
+    open positions should be closed, partially closed, or have their
+    SL/TP modified.
 
-    ``autotune_evidence`` (when present) is the digest produced by
+    ``autotune_evidence`` is the digest produced by
     :class:`src.strategy.autotune.AutotuneState.build_evidence`. The
     LLM uses it to decide whether to attach an OPTIONAL ``tuning``
     block to its response — see the system prompt for the schema.
@@ -134,20 +44,22 @@ def build_decision_prompt(
         "portfolio": dict(portfolio_summary),
         "bot_owned_positions": list(bot_owned_positions),
         "candidates": list(candidates),
+        "performance": dict(performance) if performance else None,
         "market_summary": market_summary or "",
         "cross_asset_regime": dict(cross_asset_regime) if cross_asset_regime else None,
         "strategy_rules": dict(strategy_rules) if strategy_rules else None,
         "autotune_evidence": dict(autotune_evidence) if autotune_evidence else None,
         "instructions": (
-            "For each candidate decide BUY/CLOSE/HOLD. Use the per-candidate "
-            "`tools.features` and `tools.aggregate_score` fields alongside the "
-            "base technicals. Cross-asset regime hints whether the broader "
-            "market is risk-on. Respect the per-trade cap and parallel-trades "
-            "cap; if those are tight, pick the highest-conviction subset only. "
-            "Inspect `autotune_evidence`: if the rolling raw_score distribution "
-            "and drought counters indicate the entry gate is mis-calibrated, "
-            "include a `tuning` block per the schema. Most cycles should omit it. "
-            "Return strict JSON per schema."
+            "Decide per-instrument actions covering BOTH new candidates AND "
+            "every existing bot-owned position. For each open position with "
+            "a non-empty `review.triggers`, emit CLOSE, MODIFY_STOPS, or HOLD "
+            "with explicit rationale. For new candidates use BUY (size with "
+            "`amount_usd`) or HOLD. Consult `performance.by_symbol` before "
+            "BUYing a symbol with a poor track record — either size down or "
+            "skip. Inspect `autotune_evidence`: if the rolling raw_score "
+            "distribution and drought counters indicate the entry gate is "
+            "mis-calibrated, include a `tuning` block per the schema. Most "
+            "cycles should omit it. Return strict JSON per schema."
         ),
     }
     return _DECISION_SYSTEM, json.dumps(user_payload, indent=2, default=str)
@@ -213,6 +125,33 @@ CRITICAL invariant about HOW candidacy works (the price-tool ensemble):
   instrument_feed) run downstream as enrichment / hard gates per candidate. They do
   NOT participate in candidacy. Be precise about which set you're talking about.
 
+CRITICAL invariant about WHICH positions are the bot's:
+- The eToro account may hold positions the user opened by hand or copied from a
+  popular investor (mirror positions). The bot did NOT open those — it neither
+  monitors their entries nor will it close them.
+- The JSON payload now has TWO disjoint position arrays:
+    * `bot_state.bot_owned_positions` — opened by THIS bot. Their P/L counts
+      against the bot's track record.
+    * `bot_state.manual_or_mirror_positions` — opened by the user manually or
+      mirrored from a copy-trader. Their P/L is the USER's, NOT the bot's.
+- `bot_state.counts.bot_owned` is the authoritative count for "how many positions
+  does the bot have open". NEVER use the total or `manual_or_mirror` count when
+  asked about the bot.
+- When the user asks "how is the bot doing?", "what's my P/L?", "how many positions
+  do we have?", scope the answer to `bot_owned_positions` and the bot-attributable
+  numbers in `performance.bot`. If you want to also mention overall account state,
+  label it explicitly: "Bot: X. Whole account incl. your manual trades: Y."
+
+CRITICAL invariant about P/L numbers:
+- The `performance` block (when present) contains pre-computed bot-attributable
+  P/L over multiple windows (today, 7d, 30d, all-time). Use these directly.
+  Do NOT add up trade-history entries by hand — the realized P/L on most older
+  rows is unknown and you'll under- or over-report.
+- `performance.account.unrealized_pnl` is the WHOLE account's unrealized P/L
+  (including the user's manual positions). `performance.bot.unrealized_pnl` is
+  ONLY what the bot's open positions are doing. When the user asks "am I losing
+  money", clarify which scope you mean.
+
 Hard rules:
 - You receive a JSON snapshot of the bot's live state. Answer ONLY from that snapshot
   and your general knowledge of how trading bots work. Never invent numbers; if a
@@ -232,6 +171,7 @@ def build_qa_prompt(
     question: str,
     bot_snapshot: Mapping[str, Any],
     strategy_rules: Mapping[str, Any] | None = None,
+    performance: Mapping[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Return ``(system, user)`` strings for a Q&A turn.
 
@@ -244,13 +184,65 @@ def build_qa_prompt(
     :func:`src.strategy.rules_summary.build_rules_payload`. When
     present, the LLM can quote real rule names verbatim instead of
     hallucinating "I can't see the entry signals".
+
+    ``performance`` is the structured performance payload produced by
+    :meth:`src.performance.PerformanceTracker.summary`. Without it the
+    LLM has to read raw trade history to compute P/L, which is where
+    the hallucinated "9 bot-owned positions losing $450" answer came
+    from. With it, the LLM has authoritative bot-attributable numbers
+    pre-computed.
     """
+    bot_state = dict(bot_snapshot)
+    bot_state = _partition_positions(bot_state)
     payload = {
         "question": str(question or "").strip(),
-        "bot_state": dict(bot_snapshot),
+        "bot_state": bot_state,
         "strategy_rules": dict(strategy_rules) if strategy_rules else None,
+        "performance": dict(performance) if performance else None,
     }
     return _QA_SYSTEM, json.dumps(payload, indent=2, default=str)
+
+
+def _partition_positions(bot_state: dict[str, Any]) -> dict[str, Any]:
+    """Split ``portfolio_positions`` into bot-owned vs manual/mirror.
+
+    The original payload handed the LLM ``portfolio_positions`` (every
+    open position on the eToro account, including ones the user opened
+    by hand or mirrored from a copy-trader) alongside
+    ``bot_owned_position_ids`` (the subset the bot is responsible for).
+    The LLM repeatedly conflated the two, claiming things like "you
+    have 9 bot-owned positions" when the bot owned 0. Splitting them
+    in the payload — and labelling each half explicitly — removes the
+    ambiguity. The LLM no longer needs to cross-reference IDs.
+    """
+    bot_owned_ids = {int(x) for x in (bot_state.get("bot_owned_position_ids") or [])}
+    all_positions = list(bot_state.get("portfolio_positions") or [])
+    bot_positions: list[Any] = []
+    other_positions: list[Any] = []
+    for p in all_positions:
+        if not isinstance(p, dict):
+            continue
+        pid_raw = p.get("position_id") or p.get("positionID") or p.get("positionId")
+        try:
+            pid = int(pid_raw) if pid_raw is not None else None
+        except (TypeError, ValueError):
+            pid = None
+        if pid is not None and pid in bot_owned_ids:
+            bot_positions.append(p)
+        else:
+            other_positions.append(p)
+    # Replace the ambiguous ``portfolio_positions`` with two explicit
+    # buckets. We keep the original key empty so any older prompts that
+    # rely on it can't silently pick up the wrong set.
+    bot_state["bot_owned_positions"] = bot_positions
+    bot_state["manual_or_mirror_positions"] = other_positions
+    bot_state["portfolio_positions"] = []  # intentionally cleared
+    bot_state["counts"] = {
+        "bot_owned": len(bot_positions),
+        "manual_or_mirror": len(other_positions),
+        "total_on_account": len(bot_positions) + len(other_positions),
+    }
+    return bot_state
 
 
 def build_universe_rotation_prompt(

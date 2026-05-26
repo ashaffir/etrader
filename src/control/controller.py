@@ -101,6 +101,8 @@ class BotController:
         self._news_scheduler: Any | None = None
         self._fundamentals: Any | None = None
         self._autotune_state: Any | None = None
+        self._performance: Any | None = None
+        self._dynamic_stops: Any | None = None
 
     # ------------------------------------------------------------------
     # Lock + pause primitives the cycle loop uses
@@ -142,6 +144,62 @@ class BotController:
         """Wire the autonomous-tuner state so persist_state can checkpoint it."""
         with self._lock:
             self._autotune_state = autotune_state
+
+    def set_performance_tracker(self, tracker: Any) -> None:
+        """Wire the performance tracker so /stats and /ask can read it."""
+        with self._lock:
+            self._performance = tracker
+
+    def set_dynamic_stops(self, store: Any) -> None:
+        """Wire the per-position SL/TP store so persist_state can checkpoint it."""
+        with self._lock:
+            self._dynamic_stops = store
+
+    def snapshot_performance(self) -> dict[str, Any]:
+        """Return the structured performance payload for /stats and /ask.
+
+        Returns ``{"enabled": False}`` when the tracker isn't wired
+        (e.g. unit tests). All concrete fields live inside
+        :meth:`PerformanceTracker.summary` — see that for the schema.
+        """
+        with self._lock:
+            tracker = getattr(self, "_performance", None)
+        if tracker is None:
+            return {"enabled": False}
+        payload = tracker.summary()
+        payload["enabled"] = True
+        return payload
+
+    def snapshot_performance_symbols(self) -> dict[str, Any]:
+        """Per-symbol breakdown for ``/stats by-symbol``."""
+        with self._lock:
+            tracker = getattr(self, "_performance", None)
+        if tracker is None:
+            return {"enabled": False, "rows": []}
+        return {"enabled": True, "rows": tracker.by_symbol()}
+
+    def snapshot_performance_dailies(self, *, limit: int = 30) -> dict[str, Any]:
+        """Recent daily snapshots — newest last."""
+        with self._lock:
+            tracker = getattr(self, "_performance", None)
+        if tracker is None:
+            return {"enabled": False, "rows": []}
+        return {
+            "enabled": True,
+            "rows": [d.to_dict() for d in tracker.daily_history(limit=limit)],
+        }
+
+    def snapshot_performance_closed_trades(
+        self, *, limit: int = 50,
+    ) -> dict[str, Any]:
+        with self._lock:
+            tracker = getattr(self, "_performance", None)
+        if tracker is None:
+            return {"enabled": False, "rows": []}
+        return {
+            "enabled": True,
+            "rows": [t.to_dict() for t in tracker.closed_trades(limit=limit)],
+        }
 
     # ------------------------------------------------------------------
     # Pause / resume
@@ -360,13 +418,27 @@ class BotController:
         snapshot["recent_history"] = [
             e.to_dict() for e in self._history.tail(limit=20)
         ]
-        snapshot["telemetry"] = self._telemetry.snapshot()
+        # Merge in the telemetry payload (positions, equity, etc.) so
+        # the prompt's partitioning of bot_owned vs manual positions
+        # has the source arrays it needs.
+        snapshot.update(self._telemetry.snapshot())
         rules_payload = self.snapshot_strategy_rules()
+        # Authoritative bot-attributable P/L for the LLM — without
+        # this, the LLM hand-rolls numbers from trade_history.jsonl
+        # and hallucinates (see git history for the "$450 loss"
+        # incident). With it, every P/L number is pre-computed.
+        performance_payload: dict[str, Any] | None = None
+        if self._performance is not None:
+            try:
+                performance_payload = self._performance.summary()
+            except Exception as exc:  # noqa: BLE001
+                self._logger.warning("performance.summary() failed: %s", exc)
 
         system, user = build_qa_prompt(
             question=question,
             bot_snapshot=snapshot,
             strategy_rules=rules_payload,
+            performance=performance_payload,
         )
         try:
             result = self._ai.chat_json(system=system, user=user, require_json=False)
@@ -674,11 +746,20 @@ class BotController:
                 autotune_payload = self._autotune_state.to_dict()
             except Exception as exc:  # noqa: BLE001
                 self._log.warning("[control] autotune snapshot failed: %s", exc)
+        dynamic_stops_payload: dict[str, Any] | None = None
+        if self._dynamic_stops is not None:
+            try:
+                dynamic_stops_payload = self._dynamic_stops.to_persistable()
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning(
+                    "[control] dynamic-stops snapshot failed: %s", exc,
+                )
         try:
             self._persistence.save(
                 self._state,
                 paused=self._paused,
                 autotune_payload=autotune_payload,
+                dynamic_stops_payload=dynamic_stops_payload,
             )
         except Exception as exc:  # noqa: BLE001 - never let save kill us
             self._log.warning("[control] persist failed: %s", exc)

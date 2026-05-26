@@ -8,23 +8,49 @@ trivial to write.
 
 from __future__ import annotations
 
-import datetime as dt
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Sequence
 
 from ..config import GuardrailsConfig
 from ..state import BotState
+from .kill_switch import update_and_check_kill_switch
 
 
 @dataclass(frozen=True)
 class TradeRequest:
-    """A trade request emitted by the decision engine."""
+    """A trade request emitted by the decision engine.
+
+    ``action`` ∈ ``{"BUY", "CLOSE", "MODIFY_STOPS"}``.
+
+    Per-action fields:
+
+    - ``BUY``: ``amount_usd`` is the cash to commit.
+    - ``CLOSE``: ``position_id`` is required. ``close_fraction``
+      (optional, in ``(0, 1]``) closes only that fraction of units.
+      Defaults to ``None`` (full close).
+    - ``MODIFY_STOPS``: ``position_id`` is required. At least one of
+      ``stop_loss_pct``, ``take_profit_pct``, ``trailing_stop_pct``
+      must be set. The risk layer validates ranges; the executor
+      applies them to the :class:`DynamicStopsStore` synthetically —
+      eToro's API has no modify-position endpoint, so this never
+      hits the broker.
+    """
 
     instrument_id: int
     symbol: str
-    action: str          # "BUY" | "CLOSE"
-    amount_usd: float    # for BUY only; ignored for CLOSE
-    position_id: int | None = None  # required for CLOSE
+    action: str
+    amount_usd: float
+    position_id: int | None = None
+    # CLOSE-only: fraction of units to deduct (0,1]; None = full close.
+    # Resolved at the cycle layer (which has access to the live position
+    # units) into ``close_units`` before the request reaches the executor.
+    close_fraction: float | None = None
+    close_units: float | None = None
+    # MODIFY_STOPS-only: any field that is ``None`` is left unchanged.
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
+    trailing_stop_pct: float | None = None
+    rationale: str = ""  # free-text reason from the LLM, surfaced in alerts
 
 
 @dataclass(frozen=True)
@@ -46,6 +72,7 @@ class RiskEvaluator:
         state: BotState,
         current_equity: float | None,
         bot_owned_position_count: int,
+        bot_invested_total_usd: float = 0.0,
     ) -> list[TradeVerdict]:
         # Daily-loss kill switch first — this gates every BUY this cycle.
         kill_switch_active = self._update_and_check_kill_switch(
@@ -56,6 +83,7 @@ class RiskEvaluator:
 
         verdicts: list[TradeVerdict] = []
         new_open_count = 0
+        invested_this_cycle: float = 0.0
         for req in requests:
             if req.action == "BUY":
                 v = self._evaluate_buy(
@@ -63,12 +91,20 @@ class RiskEvaluator:
                     state=state,
                     new_open_count=new_open_count,
                     bot_owned_count=bot_owned_position_count,
+                    bot_invested_total_usd=bot_invested_total_usd,
+                    invested_this_cycle=invested_this_cycle,
                     kill_switch_active=kill_switch_active,
                 )
                 if v.approved:
                     new_open_count += 1
+                    invested_this_cycle += float(
+                        v.amended_amount_usd if v.amended_amount_usd is not None
+                        else req.amount_usd
+                    )
             elif req.action == "CLOSE":
                 v = self._evaluate_close(req=req, state=state)
+            elif req.action == "MODIFY_STOPS":
+                v = self._evaluate_modify_stops(req=req, state=state)
             else:
                 v = TradeVerdict(req, False, f"unknown action {req.action!r}")
             verdicts.append(v)
@@ -83,6 +119,8 @@ class RiskEvaluator:
         state: BotState,
         new_open_count: int,
         bot_owned_count: int,
+        bot_invested_total_usd: float,
+        invested_this_cycle: float,
         kill_switch_active: bool,
     ) -> TradeVerdict:
         if kill_switch_active:
@@ -98,11 +136,29 @@ class RiskEvaluator:
             return TradeVerdict(req, False, f"cooldown {cooldown:.0f}s remaining")
         if req.amount_usd <= 0:
             return TradeVerdict(req, False, "amount_usd must be positive")
+
+        # First clamp: per-trade cap (existing behaviour).
         amended: float | None = None
         amount = req.amount_usd
         if amount > self.cfg.max_per_trade_usd:
             amended = float(self.cfg.max_per_trade_usd)
             amount = amended
+
+        # Second clamp: bot-wide total-invested budget. The headroom
+        # accounts for everything the bot already has on the broker
+        # PLUS BUYs we've approved earlier in this same cycle (so a
+        # cycle that emits multiple BUYs can't collectively bust the
+        # cap). A cap value of 0 means "disabled".
+        amount, amended, budget_reason = self._apply_budget_cap(
+            request_amount=req.amount_usd,
+            amount=amount,
+            amended=amended,
+            bot_invested_total_usd=bot_invested_total_usd,
+            invested_this_cycle=invested_this_cycle,
+        )
+        if budget_reason is not None:
+            return TradeVerdict(req, False, budget_reason)
+
         return TradeVerdict(
             req,
             True,
@@ -111,12 +167,105 @@ class RiskEvaluator:
             amended_amount_usd=amended,
         )
 
+    def _apply_budget_cap(
+        self,
+        *,
+        request_amount: float,
+        amount: float,
+        amended: float | None,
+        bot_invested_total_usd: float,
+        invested_this_cycle: float,
+    ) -> tuple[float, float | None, str | None]:
+        """Apply the total-invested cap.
+
+        Returns ``(final_amount, final_amended, reject_reason)``. When
+        ``reject_reason`` is not None the caller should refuse the BUY.
+        """
+        budget_cap = float(self.cfg.max_bot_invested_usd)
+        if budget_cap <= 0:
+            return amount, amended, None
+        already_committed = bot_invested_total_usd + invested_this_cycle
+        headroom = budget_cap - already_committed
+        if headroom <= 0:
+            return amount, amended, (
+                f"bot budget exhausted "
+                f"(${already_committed:.2f} / ${budget_cap:.2f})"
+            )
+        if amount <= headroom:
+            return amount, amended, None
+        # Need to amend down. Floor: don't post a tiny trade.
+        floor = float(self.cfg.min_amend_remainder_usd)
+        if headroom < floor:
+            return amount, amended, (
+                f"bot budget would leave only ${headroom:.2f} headroom "
+                f"(< ${floor:.2f} amend floor); rejecting"
+            )
+        return headroom, headroom, None
+
     def _evaluate_close(self, *, req: TradeRequest, state: BotState) -> TradeVerdict:
         if req.position_id is None:
             return TradeVerdict(req, False, "CLOSE requires a position_id")
         if req.position_id not in state.bot_owned_positions:
             return TradeVerdict(req, False, "position not bot-owned (refusing to close)")
-        return TradeVerdict(req, True, "approved")
+        if req.close_fraction is not None:
+            frac = float(req.close_fraction)
+            if not (0.0 < frac <= 1.0):
+                return TradeVerdict(
+                    req, False,
+                    f"close_fraction must be in (0,1]; got {frac:.4f}",
+                )
+        return TradeVerdict(
+            req, True,
+            "approved (partial close)" if (req.close_fraction or 1.0) < 1.0
+            else "approved",
+        )
+
+    def _evaluate_modify_stops(
+        self, *, req: TradeRequest, state: BotState,
+    ) -> TradeVerdict:
+        """Validate the LLM's MODIFY_STOPS request.
+
+        Guards:
+        - position must be bot-owned (refuse to touch user's positions)
+        - at least one of SL / TP / trailing must be supplied
+        - any supplied % must be in a sensible band (0, 50] — wider is
+          almost certainly a mistake the LLM is making (e.g. emitting
+          a price instead of a percentage)
+        """
+        if req.position_id is None:
+            return TradeVerdict(req, False, "MODIFY_STOPS requires a position_id")
+        if req.position_id not in state.bot_owned_positions:
+            return TradeVerdict(
+                req, False,
+                "MODIFY_STOPS refused: position not bot-owned",
+            )
+        if (
+            req.stop_loss_pct is None
+            and req.take_profit_pct is None
+            and req.trailing_stop_pct is None
+        ):
+            return TradeVerdict(
+                req, False,
+                "MODIFY_STOPS requires at least one of stop_loss_pct, "
+                "take_profit_pct, trailing_stop_pct",
+            )
+        for label, value in (
+            ("stop_loss_pct", req.stop_loss_pct),
+            ("take_profit_pct", req.take_profit_pct),
+            ("trailing_stop_pct", req.trailing_stop_pct),
+        ):
+            if value is None:
+                continue
+            try:
+                f = float(value)
+            except (TypeError, ValueError):
+                return TradeVerdict(req, False, f"{label} not numeric")
+            if f <= 0.0 or f > 50.0:
+                return TradeVerdict(
+                    req, False,
+                    f"{label}={f} out of allowed band (0, 50]",
+                )
+        return TradeVerdict(req, True, "approved (MODIFY_STOPS)")
 
     # -- helpers ---------------------------------------------------------
 
@@ -134,100 +283,26 @@ class RiskEvaluator:
         current_equity: float | None,
         bot_owned_position_count: int = 0,
     ) -> bool:
-        """Daily-loss kill switch — bot-attributable drawdown only.
-
-        Two important properties:
-
-        - The kill switch only ever fires when the bot has skin in the
-          game today (an open bot-owned position OR a successful BUY/CLOSE
-          this session-day). Drawdown caused by the user's manual or
-          mirror positions never halts the bot.
-        - The equity baseline rebases at UTC day rollover *and* whenever
-          the bot has zero exposure and zero actions today, so a recovery
-          after the user closes their own losing trade auto-clears a
-          previously-set halt.
-        """
-        today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
-        bot_has_skin = (bot_owned_position_count > 0) or (state.bot_actions_today > 0)
-
-        if state.halted_day != today:
-            # New UTC day: reset the daily counters and rebase the baseline.
-            state.halted_today = False
-            state.halted_day = today
-            state.bot_actions_today = 0
-            state.session_baseline_equity = current_equity
-            state.baseline_day = today
-        elif state.baseline_day != today:
-            # Rare: persisted baseline carried in from yesterday. Rebase.
-            state.session_baseline_equity = current_equity
-            state.baseline_day = today
-
-        if state.halted_today and not bot_has_skin:
-            # Stale halt — there's nothing the bot could have damaged today,
-            # so a previous halt cannot be attributed to it. Auto-unstick
-            # and rebase against current equity.
-            state.halted_today = False
-            state.session_baseline_equity = current_equity
-
-        if state.halted_today:
-            return True
-
-        if current_equity is None or state.session_baseline_equity is None:
-            if state.session_baseline_equity is None and current_equity is not None:
-                state.session_baseline_equity = current_equity
-                state.baseline_day = today
-            return False
-
-        if not bot_has_skin:
-            # No bot exposure → drift in the user's own positions can't trip
-            # the kill switch. Rebase the baseline so when the bot DOES start
-            # trading today, drawdown is measured from that point forward.
-            state.session_baseline_equity = current_equity
-            return False
-
-        drawdown = state.session_baseline_equity - current_equity
-        if drawdown >= self.cfg.daily_loss_stop_usd:
-            state.halted_today = True
-            return True
-        return False
+        return update_and_check_kill_switch(
+            cfg=self.cfg,
+            state=state,
+            current_equity=current_equity,
+            bot_owned_position_count=bot_owned_position_count,
+        )
 
 
-# ---------------------------------------------------------------------------
-# Stop-loss / take-profit price helpers
-# ---------------------------------------------------------------------------
+# Back-compat re-exports — the pricing helpers used to live here. They
+# moved to ``risk_pricing.py`` so this file stays under the line cap.
+# Existing imports (tests + executor) keep working.
+from .risk_pricing import (  # noqa: E402  (intentional late import)
+    aggregate_summary,
+    compute_stop_loss_take_profit,
+)
 
-def compute_stop_loss_take_profit(
-    *,
-    entry_price: float,
-    is_buy: bool,
-    stop_loss_pct: float,
-    take_profit_pct: float,
-) -> tuple[float, float]:
-    """Return ``(stop_loss_rate, take_profit_rate)`` aligned with eToro semantics.
-
-    For a BUY (long): SL is below entry, TP is above entry.
-    For a SELL (short): SL is above entry, TP is below entry.
-    """
-    if entry_price <= 0:
-        raise ValueError("entry_price must be positive")
-    if is_buy:
-        sl = entry_price * (1.0 - stop_loss_pct / 100.0)
-        tp = entry_price * (1.0 + take_profit_pct / 100.0)
-    else:
-        sl = entry_price * (1.0 + stop_loss_pct / 100.0)
-        tp = entry_price * (1.0 - take_profit_pct / 100.0)
-    sl = max(sl, 1e-4)
-    tp = max(tp, 1e-4)
-    return round(sl, 4), round(tp, 4)
-
-
-def aggregate_summary(verdicts: Iterable[TradeVerdict]) -> dict[str, int]:
-    approved = denied = capped = 0
-    for v in verdicts:
-        if v.approved:
-            approved += 1
-            if v.amended_amount_usd is not None:
-                capped += 1
-        else:
-            denied += 1
-    return {"approved": approved, "denied": denied, "capped": capped}
+__all__ = [
+    "TradeRequest",
+    "TradeVerdict",
+    "RiskEvaluator",
+    "aggregate_summary",
+    "compute_stop_loss_take_profit",
+]

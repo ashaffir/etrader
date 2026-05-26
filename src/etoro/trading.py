@@ -167,6 +167,13 @@ def compute_account_summary(snap: PortfolioSnapshot) -> dict[str, float]:
         + open_orders_external_costs_manual
     )
 
+    # P&L: eToro's /pnl response is inconsistent across account
+    # compositions. Sometimes ``unrealizedPnL`` at the top level is
+    # populated and the per-position ``pnL`` fields are zero
+    # (observed live for unleveraged cash equities); other times
+    # the per-position fields carry the truth and the top-level is
+    # zero. We pick whichever is non-zero; if both are zero the
+    # account is genuinely flat and 0 is correct.
     pnl_positions = sum(p.pnl for p in snap.positions)
     pnl_mirrors = 0.0
     for m in snap.mirrors:
@@ -176,7 +183,12 @@ def compute_account_summary(snap: PortfolioSnapshot) -> dict[str, float]:
                 inner_pnl = _g(inner_pnl, "pnL", "pnl", default=0.0)
             pnl_mirrors += float(inner_pnl or 0.0)
         pnl_mirrors += float(_g(m, "closedPositionsNetProfit", default=0.0) or 0.0)
-    profit_loss = pnl_positions + pnl_mirrors
+    per_position_pnl = pnl_positions + pnl_mirrors
+    top_level_pnl = float(snap.unrealized_pnl)
+    if top_level_pnl != 0.0:
+        profit_loss = top_level_pnl
+    else:
+        profit_loss = per_position_pnl
 
     equity = available_cash + total_invested + profit_loss
 

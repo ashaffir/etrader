@@ -15,6 +15,11 @@ from datetime import datetime, timezone
 from typing import Iterable
 
 from .ai.azure_client import AzureFoundryClient
+from .ai.decision_context import (
+    build_performance_block,
+    project_bot_owned_positions,
+    project_by_symbol_history,
+)
 from .alerts import AlertHub, AlertType
 from .config import AppConfig
 from .etoro.client import EtoroClient
@@ -31,9 +36,12 @@ from .etoro.trading import (
     compute_account_summary,
     fetch_portfolio,
 )
+from .execution.dynamic_stops import DynamicStopsStore
 from .execution.executor import ExecutionResult, TradeExecutor
 from .execution.monitor import PositionMonitor
 from .execution.stuck_orders import CancelResult, StuckOrder
+from .performance import PerformanceTracker
+from .strategy.position_review import PositionReviewer
 from .strategy.tools.base import AssetClass, asset_class_for
 from .fundamentals import FundamentalsCache
 from .news.scheduler import NewsScheduler
@@ -89,6 +97,9 @@ class CycleRunner:
         news_scheduler: NewsScheduler | None = None,
         fundamentals_cache: FundamentalsCache | None = None,
         autotune_state: AutotuneState | None = None,
+        performance: PerformanceTracker | None = None,
+        dynamic_stops: "DynamicStopsStore | None" = None,
+        position_reviewer: "PositionReviewer | None" = None,
         stop_event: threading.Event | None = None,
     ) -> None:
         self._cfg = cfg
@@ -115,6 +126,18 @@ class CycleRunner:
         # 2. evidence digest is passed to the LLM decision call;
         # 3. any tuning block in the response is applied + alerted.
         self._autotune = autotune_state
+        # Optional performance tracker. When present, the cycle records
+        # every bot-attributable open/close + per-cycle mark-to-market
+        # so /stats and the /ask LLM have authoritative P/L numbers.
+        self._performance = performance
+        # Per-position SL/TP override store. The LLM writes to it via
+        # MODIFY_STOPS actions; the monitor reads from it on every
+        # cycle to apply per-position bands (with trailing logic).
+        self._dynamic_stops = dynamic_stops
+        # Threshold-triggered reviewer. Flags open positions that
+        # breached drawdown / pullback / stale-hold / max-hold so the
+        # decision LLM is forced to attend to them this cycle.
+        self._position_reviewer = position_reviewer
         # Optional stop signal so synchronous I/O in the cycle can be
         # short-circuited mid-flight. Set by the SIGINT/SIGTERM handler.
         self._stop_event = stop_event
@@ -167,12 +190,16 @@ class CycleRunner:
         rates = self._fetch_rates(ctx.universe, prior=ctx.rate_cache)
         ctx.rate_cache.update(rates)
         snapshot = self._fetch_portfolio()
-        self._monitor.reconcile(snapshot, self._state)
+        adopted = self._monitor.reconcile(snapshot, self._state)
+        self._record_performance_opens(adopted, ctx)
         self._cancel_stuck_orders(snapshot)
+        self._record_performance_vanished(snapshot)
         bot_owned_positions = [
             p for p in snapshot.positions
             if p.position_id in self._state.bot_owned_positions and p.mirror_id == 0
         ]
+        summary = compute_account_summary(snapshot)
+        self._record_performance_observe(bot_owned_positions, summary=summary)
         self._update_owned_instrument_ids(ctx, bot_owned_positions)
         self._publish_portfolio(snapshot, bot_owned_position_ids=[
             p.position_id for p in bot_owned_positions
@@ -233,7 +260,7 @@ class CycleRunner:
                     ", ".join(f"{s}({r})" for s, r in gated),
                 )
 
-        summary = compute_account_summary(snapshot)
+        # summary computed above near reconcile; reuse here.
         rules_payload = build_rules_payload(
             strategy=self._cfg.strategy,
             guardrails=self._cfg.guardrails,
@@ -243,6 +270,32 @@ class CycleRunner:
             return
         fundamentals_payload = self._fundamentals_for_candidates(candidates)
         autotune_evidence = self._build_autotune_evidence(snapshot)
+        perf_summary = self._performance.summary() if self._performance else None
+        reviews = self._run_position_review(
+            bot_owned_positions, ctx.universe.symbol_for_id, ctx.rate_cache,
+        )
+        reviews_by_pos = {r.position_id: r for r in reviews}
+        open_states = (
+            self._performance.open_states_by_position()
+            if self._performance else {}
+        )
+        enriched_owned = project_bot_owned_positions(
+            positions=bot_owned_positions,
+            symbol_for_id=ctx.universe.symbol_for_id,
+            open_states=open_states,
+            dynamic_stops=self._dynamic_stops,
+            reviews_by_position_id=reviews_by_pos,
+        )
+        by_symbol_proj = self._build_by_symbol_projection(candidates, bot_owned_positions, ctx)
+        performance_block = build_performance_block(
+            summary=perf_summary,
+            reviews=reviews,
+            by_symbol_projection=by_symbol_proj,
+        )
+        position_units = {
+            p.position_id: float(getattr(p, "units", 0.0) or 0.0)
+            for p in bot_owned_positions
+        }
         decision = self._decision_engine.decide(
             candidates=candidates,
             portfolio_summary=summary,
@@ -253,6 +306,9 @@ class CycleRunner:
             strategy_rules=rules_payload,
             fundamentals_by_symbol=fundamentals_payload,
             autotune_evidence=autotune_evidence,
+            performance=performance_block,
+            enriched_owned_positions=enriched_owned,
+            position_units_by_id=position_units,
         )
         latency_str = f", {decision.latency_ms} ms" if decision.latency_ms is not None else ""
         self._log.info(
@@ -273,11 +329,13 @@ class CycleRunner:
         # for thresholds and weights; it's the intended cadence.
         self._apply_autotune(decision)
 
+        bot_invested_total = sum(p.amount for p in bot_owned_positions)
         verdicts = self._risk.evaluate(
             requests=decision.requests,
             state=self._state,
             current_equity=summary.get("equity"),
             bot_owned_position_count=len(bot_owned_positions),
+            bot_invested_total_usd=bot_invested_total,
         )
         # Risk evaluation flips state.halted_today; capture the edge and
         # alert the operator the FIRST time we trip the kill switch today.
@@ -581,6 +639,62 @@ class CycleRunner:
             scores.append(float(result.raw_score))
         return scores
 
+    def _run_position_review(
+        self,
+        bot_owned_positions: list,
+        symbol_for_id: dict,
+        rate_cache: dict,
+    ) -> list:
+        """Evaluate every open bot position against the trigger thresholds.
+
+        Returns the list of :class:`PositionReview` for positions that
+        fired ≥1 trigger. The list is passed to the LLM as the
+        ``performance.position_reviews`` block so triggered positions
+        force a decision instead of being silently held.
+        """
+        if self._position_reviewer is None or not bot_owned_positions:
+            return []
+        open_states = (
+            self._performance.open_states_by_position()
+            if self._performance else {}
+        )
+        return self._position_reviewer.evaluate(
+            bot_owned_positions=bot_owned_positions,
+            symbol_for_id=symbol_for_id,
+            perf_open_states=open_states,
+            live_rates=rate_cache,
+        )
+
+    def _build_by_symbol_projection(
+        self,
+        candidates: list,
+        bot_owned_positions: list,
+        ctx: "CycleContext",
+    ) -> dict[str, dict]:
+        """Build the per-symbol track-record projection for the LLM payload.
+
+        We only include symbols the LLM is likely to act on this cycle
+        (candidates + currently-owned). Closed-trade aggregates older
+        than that are noise.
+        """
+        if self._performance is None:
+            return {}
+        wanted: list[str] = []
+        for c in candidates:
+            sym = getattr(c, "symbol", None)
+            if sym:
+                wanted.append(str(sym).upper())
+        for p in bot_owned_positions:
+            sym = ctx.universe.symbol_for_id.get(p.instrument_id)
+            if sym:
+                wanted.append(sym.upper())
+        if not wanted:
+            return {}
+        return project_by_symbol_history(
+            by_symbol=self._performance.by_symbol(),
+            symbols_of_interest=wanted,
+        )
+
     def _build_autotune_evidence(
         self,
         snapshot: PortfolioSnapshot,
@@ -803,6 +917,69 @@ class CycleRunner:
     ) -> AssetClass:
         meta = ctx.instrument_metas.get(instrument_id)
         return asset_class_for(meta, symbol=symbol)
+
+    # ------------------------------------------------------------------
+    # Performance tracking hooks (no-ops when tracker not configured)
+    # ------------------------------------------------------------------
+
+    def _record_performance_opens(
+        self, adopted: list, ctx: CycleContext,
+    ) -> None:
+        if self._performance is None or not adopted:
+            return
+        for pos in adopted:
+            symbol = ctx.universe.symbol_for_id.get(pos.instrument_id, str(pos.instrument_id))
+            asset_class = self._asset_class_for(pos.instrument_id, symbol, ctx)
+            self._performance.record_open(
+                position_id=int(pos.position_id),
+                instrument_id=int(pos.instrument_id),
+                symbol=symbol,
+                asset_class=asset_class.value,
+                is_buy=bool(pos.is_buy),
+                amount_usd=float(pos.amount),
+                units=float(getattr(pos, "units", 0.0) or 0.0),
+                open_rate=float(pos.open_rate),
+            )
+
+    def _record_performance_vanished(self, snapshot: PortfolioSnapshot) -> None:
+        """Detect bot-owned positions that vanished from the broker
+        (SL/TP triggered, user manually closed, etc.) and book them
+        as realized trades. Also prunes ``state.bot_owned_positions``
+        so the set doesn't grow unbounded with stale IDs."""
+        if not self._state.bot_owned_positions:
+            return
+        snapshot_ids = {p.position_id for p in snapshot.positions}
+        vanished = [
+            pid for pid in list(self._state.bot_owned_positions)
+            if pid not in snapshot_ids
+        ]
+        if not vanished:
+            return
+        for pid in vanished:
+            if self._performance is not None:
+                trade = self._performance.record_close(
+                    position_id=pid, reason="external",
+                )
+                if trade is not None:
+                    self._log.info(
+                        "[perf] booked vanished position %s P/L=$%.2f",
+                        trade.symbol, trade.realized_pnl_usd,
+                    )
+            self._state.remove_owned(pid)
+
+    def _record_performance_observe(
+        self,
+        bot_owned_positions: list,
+        *,
+        summary: dict,
+    ) -> None:
+        if self._performance is None:
+            return
+        self._performance.observe_positions(
+            bot_positions=bot_owned_positions,
+            equity=summary.get("equity"),
+            account_unrealized_pnl=summary.get("profit_loss"),
+        )
 
     def _cancel_stuck_orders(self, snapshot: PortfolioSnapshot) -> None:
         """Detect stuck pending orders and try to cancel them.
