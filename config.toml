@@ -39,6 +39,15 @@ candle_interval          = "OneHour" # OneMinute | FiveMinutes | FifteenMinutes 
 candle_count             = 100       # candles per instrument fetched per cycle (max 1000)
 request_timeout_seconds  = 20
 trade_spacing_seconds    = 3         # min spacing between trade-execution calls (eToro caps at 20 req/min)
+# Stuck-order auto-cancel: if an order placed by the bot is still
+# pending after the market for that asset has been open for this many
+# seconds, the bot cancels it via DELETE. A Telegram alert is sent
+# ONLY if the cancel itself is refused and the order is still
+# genuinely unsettled (i.e. operator intervention is required). 0
+# disables the grace floor entirely (don't recommend).
+pending_grace_seconds_after_open = 300
+# Master switch for the stuck-order cancel pipeline.
+cancel_stuck_orders_enabled      = true
 
 # ---------------------------------------------------------------------
 # [universe] which instruments to track

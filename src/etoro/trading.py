@@ -241,6 +241,11 @@ def close_position_by_market(
 
 
 def fetch_order(client: EtoroClient, env: str, order_id: int) -> dict[str, Any]:
+    """Raw /trading/info/{env}/orders/{id} fetch.
+
+    For a typed view (``OrderStatus``, error fields) prefer
+    :func:`src.etoro.order_lifecycle.get_order_info`.
+    """
     if env not in {"demo", "real"}:
         raise ValueError(f"env must be 'demo' or 'real', got {env!r}")
     return client.get(f"/trading/info/{env}/orders/{order_id}", retries=2)

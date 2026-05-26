@@ -152,6 +152,101 @@ class DecisionEngineTests(unittest.TestCase):
         self.assertEqual(result.requests[0].position_id, 42)
 
 
+class TuningRoundTripTests(unittest.TestCase):
+    """The engine must extract an optional `tuning` block from the LLM JSON."""
+
+    def setUp(self) -> None:
+        self.guardrails = GuardrailsConfig(max_per_trade_usd=200.0)
+        self.ai_cfg = AiConfig(enabled=True, veto_on_unavailable=False)
+
+    def test_tuning_block_parsed_when_present(self) -> None:
+        ai = _FakeAi(parsed={
+            "actions": [
+                {"instrumentId": 1, "symbol": "AAPL", "action": "HOLD"},
+            ],
+            "summary": "calm",
+            "tuning": {
+                "reason": "drought",
+                "changes": [
+                    {"section": "strategy", "field": "min_signal_strength",
+                     "value": 0.25, "rationale": "rolling max 0.30"},
+                ],
+            },
+        })
+        engine = DecisionEngine(
+            ai_cfg=self.ai_cfg, guardrails=self.guardrails, ai_client=ai,  # type: ignore[arg-type]
+        )
+        result = engine.decide(
+            candidates=[_candidate()],
+            portfolio_summary={"equity": 10_000.0},
+            bot_owned_positions=[],
+            symbol_for_id={1: "AAPL"},
+        )
+        self.assertFalse(result.tuning.is_empty)
+        self.assertEqual(len(result.tuning.changes), 1)
+        self.assertEqual(result.tuning.changes[0].field, "min_signal_strength")
+        self.assertAlmostEqual(result.tuning.changes[0].value, 0.25)
+        self.assertEqual(result.tuning.reason, "drought")
+
+    def test_missing_tuning_block_returns_empty_request(self) -> None:
+        ai = _FakeAi(parsed={
+            "actions": [{"instrumentId": 1, "symbol": "AAPL", "action": "HOLD"}],
+            "summary": "ok",
+        })
+        engine = DecisionEngine(
+            ai_cfg=self.ai_cfg, guardrails=self.guardrails, ai_client=ai,  # type: ignore[arg-type]
+        )
+        result = engine.decide(
+            candidates=[_candidate()],
+            portfolio_summary={"equity": 10_000.0},
+            bot_owned_positions=[],
+            symbol_for_id={1: "AAPL"},
+        )
+        self.assertTrue(result.tuning.is_empty)
+
+    def test_evidence_only_call_still_runs_when_no_candidates(self) -> None:
+        # Even without any candidates, if there's autotune_evidence the
+        # engine should call the LLM (so a stuck bot can self-unstick).
+        ai = _FakeAi(parsed={
+            "actions": [],
+            "summary": "drought",
+            "tuning": {
+                "reason": "no candidates 4h",
+                "changes": [
+                    {"section": "strategy", "field": "min_signal_strength",
+                     "value": 0.20, "rationale": "loosen"},
+                ],
+            },
+        })
+        engine = DecisionEngine(
+            ai_cfg=self.ai_cfg, guardrails=self.guardrails, ai_client=ai,  # type: ignore[arg-type]
+        )
+        result = engine.decide(
+            candidates=[],
+            portfolio_summary={"equity": 10_000.0},
+            bot_owned_positions=[],
+            symbol_for_id={},
+            autotune_evidence={"cycle_index": 100,
+                               "drought": {"cycles_since_last_candidate": 240}},
+        )
+        self.assertTrue(result.llm_used)
+        self.assertFalse(result.tuning.is_empty)
+
+    def test_no_candidates_no_evidence_short_circuits(self) -> None:
+        ai = _FakeAi(parsed={"actions": []})
+        engine = DecisionEngine(
+            ai_cfg=self.ai_cfg, guardrails=self.guardrails, ai_client=ai,  # type: ignore[arg-type]
+        )
+        result = engine.decide(
+            candidates=[],
+            portfolio_summary={},
+            bot_owned_positions=[],
+            symbol_for_id={},
+        )
+        self.assertEqual(ai.calls, 0)
+        self.assertFalse(result.llm_used)
+
+
 class RenderTests(unittest.TestCase):
     def test_render_empty(self) -> None:
         self.assertEqual(render_decisions([]), "HOLD all")

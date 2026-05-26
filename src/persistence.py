@@ -36,14 +36,19 @@ class PersistenceMeta:
     schema_version: int = _SCHEMA_VERSION
 
 
-def _state_to_dict(state: BotState, *, paused: bool) -> dict:
+def _state_to_dict(
+    state: BotState,
+    *,
+    paused: bool,
+    autotune_payload: dict | None = None,
+) -> dict:
     now_mono = time.monotonic()
     now_wall = time.time()
     last_action_wall: dict[str, float] = {}
     for inst_id, mono_ts in state.last_action_per_instrument.items():
         elapsed = max(0.0, now_mono - mono_ts)
         last_action_wall[str(inst_id)] = now_wall - elapsed
-    return {
+    out: dict = {
         "schema_version": _SCHEMA_VERSION,
         "saved_at_unix": now_wall,
         "paused": bool(paused),
@@ -57,6 +62,9 @@ def _state_to_dict(state: BotState, *, paused: bool) -> dict:
         "bot_actions_today": int(state.bot_actions_today),
         "baseline_day": state.baseline_day,
     }
+    if autotune_payload is not None:
+        out["autotune"] = autotune_payload
+    return out
 
 
 def _state_from_dict(data: dict) -> tuple[BotState, PersistenceMeta]:
@@ -111,18 +119,48 @@ class StatePersistence:
     def path(self) -> Path:
         return self._path
 
-    def save(self, state: BotState, *, paused: bool) -> None:
-        """Persist ``state`` atomically. Logs and swallows any I/O error."""
+    def save(
+        self,
+        state: BotState,
+        *,
+        paused: bool,
+        autotune_payload: dict | None = None,
+    ) -> None:
+        """Persist ``state`` atomically. Logs and swallows any I/O error.
+
+        ``autotune_payload`` is the serialised :class:`AutotuneState`
+        snapshot (drought counters + recent tuning log). Optional so
+        legacy call sites that don't know about the tuner continue to
+        work — the autotune block is simply omitted from the file.
+        """
         self._path.parent.mkdir(parents=True, exist_ok=True)
         try:
             tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            payload = _state_to_dict(
+                state,
+                paused=paused,
+                autotune_payload=autotune_payload,
+            )
             tmp.write_text(
-                json.dumps(_state_to_dict(state, paused=paused), indent=2),
+                json.dumps(payload, indent=2),
                 encoding="utf-8",
             )
             os.replace(tmp, self._path)
         except OSError as exc:
             self._logger.warning("state save failed: %s", exc)
+
+    def load_autotune(self) -> dict | None:
+        """Return the persisted autotune block from the state file, or None."""
+        if not self._path.exists():
+            return None
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        block = data.get("autotune")
+        return block if isinstance(block, dict) else None
 
     def load(self) -> tuple[BotState | None, PersistenceMeta | None]:
         """Return ``(state, meta)`` or ``(None, None)`` if nothing usable."""

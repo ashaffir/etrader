@@ -106,6 +106,21 @@ class EtoroClient:
             retries = 0
         return self._request("POST", path, json_body=json, retries=retries).json
 
+    def delete(
+        self,
+        path: str,
+        *,
+        retries: int = 0,
+    ) -> Any:
+        # Trade-execution DELETEs (order cancellation) are at-most-once,
+        # same as POSTs: a network blip while eToro processed the cancel
+        # would otherwise risk a spurious re-cancel against an order that
+        # has since been re-created (extremely unlikely, but the cost of
+        # being explicit is zero).
+        if _is_trade_execution(path):
+            retries = 0
+        return self._request("DELETE", path, retries=retries).json
+
     # -- internals --------------------------------------------------------
 
     def _build_headers(self) -> dict[str, str]:

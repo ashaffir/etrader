@@ -94,6 +94,30 @@ class PersistenceRoundTripTests(unittest.TestCase):
         assert loaded is not None
         self.assertEqual(loaded.bot_owned_positions, set())
 
+    def test_autotune_payload_round_trips(self) -> None:
+        store = StatePersistence(self.path)
+        payload = {
+            "cycles_since_last_candidate": 12,
+            "cycles_since_last_trade": 240,
+            "cycles_since_last_fill": 240,
+            "tunings": [
+                {"timestamp_unix": 1_700_000_000.0,
+                 "reason": "drought",
+                 "changes": [{"section": "strategy",
+                              "field": "min_signal_strength",
+                              "previous": 0.40, "current": 0.25,
+                              "rationale": "rolling max 0.30"}]},
+            ],
+        }
+        store.save(BotState(), paused=False, autotune_payload=payload)
+        loaded_block = store.load_autotune()
+        self.assertEqual(loaded_block, payload)
+
+    def test_legacy_file_has_no_autotune_block(self) -> None:
+        store = StatePersistence(self.path)
+        store.save(BotState(), paused=False)
+        self.assertIsNone(store.load_autotune())
+
 
 if __name__ == "__main__":
     unittest.main()

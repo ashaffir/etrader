@@ -50,6 +50,17 @@ class AlertType(str, Enum):
     # promising news story isn't tradeable on eToro.
     UNIVERSE_REJECTED = "universe_rejected"
     BOT_PAUSED_RESUMED = "bot_paused_resumed"
+    # Emitted whenever the autonomous-tuner overlay edits a strategy
+    # or tools field at runtime (e.g. lowers min_signal_strength
+    # because the bot has been silent for hours). The body carries the
+    # diff and the LLM's rationale.
+    STRATEGY_AUTOTUNED = "strategy_autotuned"
+    # Emitted only when the bot detects a stuck order (placed, not
+    # executed within its session-grace window) AND the eToro DELETE
+    # cancel call refused (4xx — order already terminal). Successful
+    # auto-cancels are NOT alerted; operators only need to know when
+    # manual intervention is required.
+    ORDER_STUCK_CANT_CANCEL = "order_stuck_cant_cancel"
 
     @classmethod
     def all_types(cls) -> list["AlertType"]:
@@ -70,6 +81,12 @@ _SAFETY_ONLY_DEFAULT = frozenset({
     AlertType.DAILY_LOSS_HALT,
     AlertType.CYCLE_ERROR,
     AlertType.TRADE_FAILED,
+    # The autonomous tuner edits real bot behaviour; opt in by default
+    # so operators always know when the manager touched something.
+    AlertType.STRATEGY_AUTOTUNED,
+    # Stuck-and-uncancellable orders need operator attention: the bot
+    # cannot resolve them on its own.
+    AlertType.ORDER_STUCK_CANT_CANCEL,
 })
 
 

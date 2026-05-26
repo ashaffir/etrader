@@ -41,6 +41,7 @@ from .news.scheduler import NewsScheduler
 from .persistence import StatePersistence
 from .state import BotState
 from .strategy.activity_filter import ActivityFilter
+from .strategy.autotune import AutotuneState
 from .strategy.decisions import DecisionEngine
 from .strategy.risk import RiskEvaluator
 from .strategy.tool_orchestration import ToolOrchestrator
@@ -113,6 +114,8 @@ class TradingBot:
         self._fundamentals = self._build_fundamentals_cache()
         if self._fundamentals is not None:
             self.controller.set_fundamentals(self._fundamentals)
+        self._autotune = self._build_autotune_state()
+        self.controller.set_autotune_state(self._autotune)
         self._control_server = self._maybe_start_control_server()
         self._runner = self._build_runner()
 
@@ -241,9 +244,33 @@ class TradingBot:
             alerts=self.alerts,
             news_scheduler=self._news_scheduler,
             fundamentals_cache=self._fundamentals,
+            autotune_state=self._autotune,
             stop_event=self._stop_event,
             log=get_logger("cycle", tag="cycle"),
         )
+
+    def _build_autotune_state(self) -> AutotuneState:
+        """Construct the autonomous-tuner state machine.
+
+        Restores any persisted drought counters + tuning log from
+        ``bot_state.json`` so a restart doesn't lose the LLM's
+        accumulated context.
+        """
+        autotune = AutotuneState(
+            config_store=self._config_store,
+            logger=get_logger("strategy.autotune", tag="autotune"),
+        )
+        persisted = self._persistence.load_autotune()
+        if persisted:
+            autotune.restore(persisted)
+            self.log.info(
+                "[autotune] restored: drought_candidates=%d drought_trades=%d "
+                "previous_tunings=%d",
+                persisted.get("cycles_since_last_candidate", 0),
+                persisted.get("cycles_since_last_trade", 0),
+                len(persisted.get("tunings") or []),
+            )
+        return autotune
 
     def _build_news_pipeline(self) -> tuple[CandidateStore | None, NewsScheduler | None]:
         """Construct the news aggregator + scheduler (or short-circuit).

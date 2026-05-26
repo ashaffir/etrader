@@ -5,6 +5,7 @@ Submodules:
 - :mod:`client` — HTTP session with retries, headers, auth.
 - :mod:`market_data` — search, instruments, rates, candles.
 - :mod:`trading` — open / close orders, PnL endpoint.
+- :mod:`order_lifecycle` — order status + cancel endpoints.
 - :mod:`identity` — `/api/v1/me`.
 - :mod:`watchlists` — curated lists, market recommendations.
 - :mod:`instrument_cache` — JSON-persisted symbol↔instrumentID map.

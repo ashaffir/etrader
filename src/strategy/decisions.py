@@ -18,6 +18,8 @@ from ..ai.azure_client import AiCallResult, AzureFoundryClient, AzureUnavailable
 from ..ai.prompts import build_decision_prompt
 from ..config import AiConfig, GuardrailsConfig
 from ..etoro.trading import Position
+from .autotune_parse import parse_tune_request
+from .autotune_types import TuneRequest
 from .risk import TradeRequest
 from .signals import Candidate
 from .tools.runner import ToolRunResult
@@ -30,6 +32,11 @@ class DecisionResult:
     llm_used: bool
     latency_ms: int | None
     raw_text: str | None
+    # Optional tuning suggestion the LLM attached this cycle. The
+    # cycle wrapper applies it via :class:`AutotuneState.apply` and
+    # emits a Telegram alert; for the deterministic fallback or when
+    # the LLM didn't include a `tuning` block this is an empty request.
+    tuning: TuneRequest = TuneRequest()
 
 
 class DecisionEngine:
@@ -60,11 +67,20 @@ class DecisionEngine:
         cross_asset_regime: Mapping[str, Any] | None = None,
         strategy_rules: Mapping[str, Any] | None = None,
         fundamentals_by_symbol: Mapping[str, Mapping[str, Any]] | None = None,
+        autotune_evidence: Mapping[str, Any] | None = None,
     ) -> DecisionResult:
-        if not candidates:
-            return DecisionResult(requests=[], summary="no candidates", llm_used=False, latency_ms=None, raw_text=None)
-
         tool_results = tool_results or {}
+
+        # Even when there are no candidates we still want the LLM call
+        # if there's autotune evidence to deliver — that's how a stuck
+        # bot can be unstuck. When neither candidates nor evidence are
+        # available there's nothing to do.
+        has_evidence = bool(autotune_evidence)
+        if not candidates and not has_evidence:
+            return DecisionResult(
+                requests=[], summary="no candidates", llm_used=False,
+                latency_ms=None, raw_text=None,
+            )
 
         if self._ai_cfg.enabled and self._ai_client is not None:
             try:
@@ -78,14 +94,17 @@ class DecisionEngine:
                     cross_asset_regime=cross_asset_regime,
                     strategy_rules=strategy_rules,
                     fundamentals_by_symbol=fundamentals_by_symbol or {},
+                    autotune_evidence=autotune_evidence,
                 )
                 requests = self._requests_from_llm(ai_result.parsed_json, candidates, bot_owned_positions)
+                tuning = self._tuning_from_llm(ai_result.parsed_json)
                 return DecisionResult(
                     requests=requests,
                     summary=self._summary_from_llm(ai_result.parsed_json),
                     llm_used=True,
                     latency_ms=ai_result.latency_ms,
                     raw_text=ai_result.text,
+                    tuning=tuning,
                 )
             except AzureUnavailable as exc:
                 self._logger.warning("LLM unavailable, %s", "vetoing trades" if self._ai_cfg.veto_on_unavailable else "falling back deterministic")
@@ -99,6 +118,8 @@ class DecisionEngine:
                     )
 
         # Deterministic fallback. Honors hard gates from tool_results.
+        # No tuning ever happens deterministically — only the LLM owns
+        # the calibration knobs.
         return DecisionResult(
             requests=self._deterministic_requests(candidates, bot_owned_positions, tool_results),
             summary="deterministic fallback (LLM disabled or unavailable)",
@@ -121,6 +142,7 @@ class DecisionEngine:
         cross_asset_regime: Mapping[str, Any] | None,
         strategy_rules: Mapping[str, Any] | None,
         fundamentals_by_symbol: Mapping[str, Mapping[str, Any]],
+        autotune_evidence: Mapping[str, Any] | None,
     ) -> AiCallResult:
         assert self._ai_client is not None
         owned = [
@@ -158,8 +180,16 @@ class DecisionEngine:
             market_summary=market_summary,
             cross_asset_regime=cross_asset_regime,
             strategy_rules=strategy_rules,
+            autotune_evidence=autotune_evidence,
         )
         return self._ai_client.chat_json(system=system, user=user, require_json=True)
+
+    @staticmethod
+    def _tuning_from_llm(parsed: Any) -> TuneRequest:
+        """Extract the optional ``tuning`` block from the LLM JSON."""
+        if not isinstance(parsed, dict):
+            return TuneRequest()
+        return parse_tune_request(parsed.get("tuning"))
 
     def _requests_from_llm(
         self,

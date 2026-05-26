@@ -29,7 +29,9 @@ class AlertTypeTests(unittest.TestCase):
         self.assertIn("bot_paused_resumed", names)
         self.assertIn("trade_failed", names)
         self.assertIn("universe_rejected", names)
-        self.assertEqual(len(names), 10)
+        self.assertIn("strategy_autotuned", names)
+        self.assertIn("order_stuck_cant_cancel", names)
+        self.assertEqual(len(names), 12)
         self.assertNotIn("cycle_heartbeat", names)
 
     def test_safety_only_default_subset(self) -> None:
@@ -39,6 +41,12 @@ class AlertTypeTests(unittest.TestCase):
             AlertType.DAILY_LOSS_HALT,
             AlertType.CYCLE_ERROR,
             AlertType.TRADE_FAILED,
+            # The autotuner edits real bot behaviour; we want operators
+            # to always see when it fires, so it's seeded ON by default.
+            AlertType.STRATEGY_AUTOTUNED,
+            # Stuck orders that can't be auto-cancelled require manual
+            # intervention.
+            AlertType.ORDER_STUCK_CANT_CANCEL,
         })
 
     def test_from_value_unknown_returns_none(self) -> None:

@@ -100,6 +100,7 @@ class BotController:
         self._news_store: Any | None = None
         self._news_scheduler: Any | None = None
         self._fundamentals: Any | None = None
+        self._autotune_state: Any | None = None
 
     # ------------------------------------------------------------------
     # Lock + pause primitives the cycle loop uses
@@ -136,6 +137,11 @@ class BotController:
         """Wire in the live fundamentals cache so /fundamentals can read it."""
         with self._lock:
             self._fundamentals = cache
+
+    def set_autotune_state(self, autotune_state: Any) -> None:
+        """Wire the autonomous-tuner state so persist_state can checkpoint it."""
+        with self._lock:
+            self._autotune_state = autotune_state
 
     # ------------------------------------------------------------------
     # Pause / resume
@@ -662,8 +668,18 @@ class BotController:
     # ------------------------------------------------------------------
 
     def persist_state(self) -> None:
+        autotune_payload: dict[str, Any] | None = None
+        if self._autotune_state is not None:
+            try:
+                autotune_payload = self._autotune_state.to_dict()
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning("[control] autotune snapshot failed: %s", exc)
         try:
-            self._persistence.save(self._state, paused=self._paused)
+            self._persistence.save(
+                self._state,
+                paused=self._paused,
+                autotune_payload=autotune_payload,
+            )
         except Exception as exc:  # noqa: BLE001 - never let save kill us
             self._log.warning("[control] persist failed: %s", exc)
 
@@ -779,4 +795,5 @@ _ALERT_LABELS: dict[AlertType, str] = {
     AlertType.UNIVERSE_CHANGED:   "Tracked universe changed",
     AlertType.UNIVERSE_REJECTED:  "Universe candidates rejected (activity filter)",
     AlertType.BOT_PAUSED_RESUMED: "Bot paused / resumed",
+    AlertType.STRATEGY_AUTOTUNED: "Strategy autotuned by manager LLM",
 }

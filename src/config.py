@@ -91,6 +91,20 @@ class OperationsConfig:
     candle_count: int = 100
     request_timeout_seconds: int = 20
     trade_spacing_seconds: int = 3
+    # Stuck-order detection: an order placed at-or-before
+    # `pending_grace_seconds_after_open` ago, sitting unfilled while
+    # its asset's market is open, is auto-cancelled. The bot alerts
+    # via Telegram ONLY when the cancel itself fails (e.g. broker
+    # refused because the order already terminal but recheck showed
+    # it's neither EXECUTED nor CANCELLED). Defaults to 5 minutes —
+    # long enough to absorb broker queueing, short enough to keep
+    # capital from getting parked on a stale pending order.
+    pending_grace_seconds_after_open: int = 300
+    # Master kill-switch for the stuck-order cancel pipeline. When
+    # False the monitor still DETECTS stuck orders (for logging) but
+    # never issues DELETE calls. Useful when debugging without taking
+    # real cancel actions.
+    cancel_stuck_orders_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -207,7 +221,7 @@ class FundamentalsConfig:
     enrich_decision_prompt: bool = True
 
 
-@dataclass(frozen=True)
+@dataclass
 class StrategyConfig:
     """Tunables for the price-tool entry / exit ensemble.
 
@@ -220,6 +234,10 @@ class StrategyConfig:
     Combined raw_score is computed as ``sum(weight_i * score_i) /
     sum(|weight_i|)``. ``buy_strength = max(0, raw_score)``,
     ``sell_strength = max(0, -raw_score)``.
+
+    Mutable by design: the autonomous-tuner overlay (see
+    :mod:`src.strategy.autotune`) edits these fields at runtime so
+    every cycle sees the latest values without rebuilding configs.
     """
 
     # Indicator periods
@@ -262,7 +280,7 @@ class AiConfig:
     decision_lookback_candles: int = 30
 
 
-@dataclass(frozen=True)
+@dataclass
 class ToolsConfig:
     """Knobs for the tool catalog + selector.
 
@@ -270,6 +288,10 @@ class ToolsConfig:
     tool is enabled, the selector keeps up to 14 tools per cycle, and
     a tool needs at least 30 outcomes before its hit-rate is allowed
     to demote it.
+
+    Mutable by design: the autonomous-tuner overlay can edit
+    ``spread_max_pct`` (and other gate knobs) so a stuck symbol
+    can be unblocked without an operator restart.
     """
 
     enabled: bool = True

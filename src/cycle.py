@@ -33,10 +33,15 @@ from .etoro.trading import (
 )
 from .execution.executor import ExecutionResult, TradeExecutor
 from .execution.monitor import PositionMonitor
+from .execution.stuck_orders import CancelResult, StuckOrder
+from .strategy.tools.base import AssetClass, asset_class_for
 from .fundamentals import FundamentalsCache
 from .news.scheduler import NewsScheduler
 from .state import BotState
+from .strategy.autotune import AutotuneState
+from .strategy.autotune_parse import render_tune_diff
 from .strategy.decisions import DecisionEngine, DecisionResult, render_decisions
+from .strategy.ensemble import evaluate_ensemble
 from .strategy.risk import RiskEvaluator, aggregate_summary
 from .strategy.rules_summary import build_rules_payload
 from .strategy.signals import build_candidates
@@ -83,6 +88,7 @@ class CycleRunner:
         alerts: AlertHub | None = None,
         news_scheduler: NewsScheduler | None = None,
         fundamentals_cache: FundamentalsCache | None = None,
+        autotune_state: AutotuneState | None = None,
         stop_event: threading.Event | None = None,
     ) -> None:
         self._cfg = cfg
@@ -104,6 +110,11 @@ class CycleRunner:
         # up on every universe refresh and project a trim dict into
         # the LLM decision prompt for each candidate.
         self._fundamentals = fundamentals_cache
+        # Autonomous-tuner overlay. When present, every cycle:
+        # 1. raw_score histogram is folded in via observe_cycle();
+        # 2. evidence digest is passed to the LLM decision call;
+        # 3. any tuning block in the response is applied + alerted.
+        self._autotune = autotune_state
         # Optional stop signal so synchronous I/O in the cycle can be
         # short-circuited mid-flight. Set by the SIGINT/SIGTERM handler.
         self._stop_event = stop_event
@@ -157,6 +168,7 @@ class CycleRunner:
         ctx.rate_cache.update(rates)
         snapshot = self._fetch_portfolio()
         self._monitor.reconcile(snapshot, self._state)
+        self._cancel_stuck_orders(snapshot)
         bot_owned_positions = [
             p for p in snapshot.positions
             if p.position_id in self._state.bot_owned_positions and p.mirror_id == 0
@@ -180,6 +192,19 @@ class CycleRunner:
             len(candidates),
             ", ".join(f"{c.action} {c.symbol}({c.strength:.2f})" for c in candidates) or "—",
         )
+
+        # Fold the *full* raw_score distribution (every tracked symbol,
+        # not just the ones above threshold) into the autotuner state
+        # BEFORE the LLM call so the evidence digest includes this
+        # cycle's data. record_trades_placed below finalises the
+        # snapshot once execution is done.
+        if self._autotune is not None:
+            self._autotune.observe_cycle(
+                cycle_index=self._state.cycle_count,
+                tracked_count=len(ctx.universe.instrument_ids),
+                raw_scores=self._raw_scores_for_universe(candles_by_instrument),
+                candidates_count=len(candidates),
+            )
 
         tool_results: dict[int, ToolRunResult] = {}
         cross_asset_regime: dict | None = None
@@ -217,6 +242,7 @@ class CycleRunner:
         if self._abort_if_stopping("before LLM decision"):
             return
         fundamentals_payload = self._fundamentals_for_candidates(candidates)
+        autotune_evidence = self._build_autotune_evidence(snapshot)
         decision = self._decision_engine.decide(
             candidates=candidates,
             portfolio_summary=summary,
@@ -226,6 +252,7 @@ class CycleRunner:
             cross_asset_regime=cross_asset_regime,
             strategy_rules=rules_payload,
             fundamentals_by_symbol=fundamentals_payload,
+            autotune_evidence=autotune_evidence,
         )
         latency_str = f", {decision.latency_ms} ms" if decision.latency_ms is not None else ""
         self._log.info(
@@ -240,6 +267,11 @@ class CycleRunner:
         # Edge-detect Azure availability AFTER the decision is published
         # so the alert reflects the cycle the user just saw.
         self.emit_ai_state_if_changed(decision_used_llm=decision.llm_used)
+        # Apply any tuning the manager LLM emitted this cycle. The
+        # changes take effect NEXT cycle's candidacy step (this cycle
+        # has already past the build_candidates call) which is fine
+        # for thresholds and weights; it's the intended cadence.
+        self._apply_autotune(decision)
 
         verdicts = self._risk.evaluate(
             requests=decision.requests,
@@ -263,21 +295,15 @@ class CycleRunner:
         results = self._executor.execute_all(
             verdicts=verdicts, rates=rates, state=self._state,
         )
-        for r in results:
-            if (
-                r.status == "ok"
-                and r.action == "BUY"
-                and r.order_id is not None
-                and r.instrument_id is not None
-            ):
-                self._monitor.track_open(
-                    order_id=r.order_id,
-                    instrument_id=r.instrument_id,
-                    symbol=r.request_symbol,
-                    amount_usd=r.amount_usd or 0.0,
-                    placed_at_monotonic=time.monotonic(),
-                )
+        self._track_placed_orders(results, ctx)
         self._record_history(results)
+        # Finalise this cycle's autotune snapshot with the actual
+        # number of successful orders (BUY or CLOSE). Failed/skipped
+        # status entries don't count: the manager needs to see when
+        # the bot *actually* trades, not when the LLM intended to.
+        if self._autotune is not None:
+            actual_trades = sum(1 for r in results if r.status == "ok")
+            self._autotune.record_trades_placed(trades_placed=actual_trades)
 
         self._log_portfolio_summary(summary, len(bot_owned_positions))
         self._log_results(results)
@@ -522,6 +548,111 @@ class CycleRunner:
             )
 
     # ------------------------------------------------------------------
+    # Autonomous-tuner integration
+    # ------------------------------------------------------------------
+
+    def _raw_scores_for_universe(
+        self,
+        candles_by_instrument: dict[int, list[Candle]],
+    ) -> list[float]:
+        """Compute the raw_score across EVERY tracked symbol this cycle.
+
+        The signals layer only returns symbols *above* the threshold;
+        the autotuner needs the *full* distribution (including symbols
+        well below the bar) so the LLM can detect a mis-calibrated
+        gate (e.g. everyone clustered at 0.30 when the threshold is 0.40).
+        """
+        scores: list[float] = []
+        for candles in candles_by_instrument.values():
+            if not candles or len(candles) < 5:
+                continue
+            closes = [c.close for c in candles if c.close > 0]
+            highs = [c.high if c.high > 0 else c.close for c in candles]
+            lows = [c.low if c.low > 0 else c.close for c in candles]
+            if not closes:
+                continue
+            try:
+                result = evaluate_ensemble(
+                    closes=closes, highs=highs, lows=lows,
+                    cfg=self._cfg.strategy,
+                )
+            except Exception:  # noqa: BLE001 - never let a single symbol kill the cycle
+                continue
+            scores.append(float(result.raw_score))
+        return scores
+
+    def _build_autotune_evidence(
+        self,
+        snapshot: PortfolioSnapshot,
+    ) -> dict | None:
+        """Materialise the per-cycle evidence digest for the LLM. None if disabled."""
+        if self._autotune is None:
+            return None
+        # Use the live cfg-aware helper now that the bound method exists.
+        # (Replaces the placeholder static helper above for the actual
+        # data path; the static helper is kept for tests.)
+        recent_pnl = self._recent_realized_pnl()
+        open_pnl = float(snapshot.unrealized_pnl or 0.0)
+        evidence = self._autotune.build_evidence(
+            cfg=self._cfg,
+            recent_realized_pnl=recent_pnl,
+            open_position_pnl_total=open_pnl,
+        )
+        return evidence.to_dict()
+
+    def _recent_realized_pnl(self, *, limit: int = 10) -> list[dict]:
+        """Recent CLOSE-action trade-history entries with extracted P&L hints.
+
+        The history log doesn't carry realised-P&L numerically yet —
+        the executor records ``detail`` and ``status`` only. For the
+        LLM's purpose we project the last ``limit`` close-style entries
+        (CLOSE / panic_close) and their statuses so the model can
+        reason about trade frequency and failure rate.
+        """
+        if self._history is None:
+            return []
+        try:
+            entries = self._history.tail(limit=int(limit))
+        except Exception:  # noqa: BLE001
+            return []
+        out: list[dict] = []
+        for e in entries:
+            d = e.to_dict() if hasattr(e, "to_dict") else dict(e)
+            out.append({
+                "timestamp": d.get("timestamp"),
+                "action": d.get("action"),
+                "status": d.get("status"),
+                "symbol": d.get("symbol"),
+                "amount_usd": d.get("amount_usd"),
+                "detail": d.get("detail"),
+            })
+        return out
+
+    def _apply_autotune(self, decision: DecisionResult) -> None:
+        """Apply any tuning request the LLM attached + emit the alert."""
+        if self._autotune is None:
+            return
+        tuning = getattr(decision, "tuning", None)
+        if tuning is None or tuning.is_empty:
+            return
+        applied = self._autotune.apply(tuning, cfg=self._cfg)
+        if not applied:
+            return
+        diff = render_tune_diff(applied)
+        rationale_lines = [a.rationale for a in applied if a.rationale]
+        body = diff
+        if tuning.reason:
+            body += f"\n\nReason: {tuning.reason}"
+        if rationale_lines:
+            body += "\n\nPer-change:\n" + "\n".join(f"• {r}" for r in rationale_lines)
+        self._log.info("[autotune] %s", diff)
+        self._emit(
+            AlertType.STRATEGY_AUTOTUNED,
+            title=f"AUTOTUNED ({len(applied)} change{'s' if len(applied) != 1 else ''})",
+            body=body,
+        )
+
+    # ------------------------------------------------------------------
     # Telemetry & trade-history publishing (used by the Telegram service)
     # ------------------------------------------------------------------
 
@@ -626,6 +757,110 @@ class CycleRunner:
             self._alerts.emit(alert_type, title=title, body=body)
         except Exception as exc:  # noqa: BLE001 - alerts must never block a cycle
             self._log.warning("[alerts] emit failed for %s: %s", alert_type.value, exc)
+
+    # ------------------------------------------------------------------
+    # Order-lifecycle plumbing
+    # ------------------------------------------------------------------
+
+    def _track_placed_orders(
+        self, results: list[ExecutionResult], ctx: CycleContext,
+    ) -> None:
+        """Register successfully-placed orders with the position monitor.
+
+        Both BUY (market-open) and CLOSE (market-close) orders are
+        tracked so the stuck-order pipeline can later detect either
+        kind sitting unfilled past its session-grace window.
+        """
+        now_utc = datetime.now(timezone.utc)
+        now_mono = time.monotonic()
+        for r in results:
+            if r.status != "ok" or r.order_id is None or r.instrument_id is None:
+                continue
+            asset_class = self._asset_class_for(r.instrument_id, r.request_symbol, ctx)
+            if r.action == "BUY":
+                self._monitor.track_open(
+                    order_id=r.order_id,
+                    instrument_id=r.instrument_id,
+                    symbol=r.request_symbol,
+                    asset_class=asset_class,
+                    amount_usd=r.amount_usd or 0.0,
+                    placed_at_utc=now_utc,
+                    placed_at_monotonic=now_mono,
+                )
+            elif r.action == "CLOSE" and r.position_id is not None:
+                self._monitor.track_close(
+                    order_id=r.order_id,
+                    position_id=r.position_id,
+                    instrument_id=r.instrument_id,
+                    symbol=r.request_symbol,
+                    asset_class=asset_class,
+                    placed_at_utc=now_utc,
+                    placed_at_monotonic=now_mono,
+                )
+
+    def _asset_class_for(
+        self, instrument_id: int, symbol: str, ctx: CycleContext,
+    ) -> AssetClass:
+        meta = ctx.instrument_metas.get(instrument_id)
+        return asset_class_for(meta, symbol=symbol)
+
+    def _cancel_stuck_orders(self, snapshot: PortfolioSnapshot) -> None:
+        """Detect stuck pending orders and try to cancel them.
+
+        Telegram alerts (``ORDER_STUCK_CANT_CANCEL``) fire ONLY when
+        the cancel itself is refused AND the post-failure status
+        recheck confirms the order is still non-terminal. Successful
+        auto-cancels and "raced and lost — actually filled" outcomes
+        are logged but not alerted, per the project's noise budget.
+        """
+        if self._monitor.tracked_count == 0:
+            return
+        grace = int(self._cfg.operations.pending_grace_seconds_after_open)
+        now_utc = datetime.now(timezone.utc)
+        stuck = self._monitor.find_stuck(
+            snapshot,
+            now_utc=now_utc,
+            grace_seconds_after_open=grace,
+        )
+        if not stuck:
+            return
+        self._log.warning(
+            "[monitor] %d stuck order(s) detected: %s",
+            len(stuck),
+            ", ".join(
+                f"{s.tracked.action} {s.tracked.symbol}#{s.tracked.order_id} "
+                f"(waited {s.waited_seconds}s, in-session {s.in_session_seconds}s)"
+                for s in stuck
+            ),
+        )
+        if not self._cfg.operations.cancel_stuck_orders_enabled:
+            self._log.info(
+                "[monitor] cancel_stuck_orders_enabled=false — not cancelling",
+            )
+            return
+        for s in stuck:
+            result = self._monitor.cancel(
+                self._etoro, env=self._cfg.env_segment, stuck=s,
+            )
+            if result.alert:
+                self._emit_stuck_alert(s, result)
+
+    def _emit_stuck_alert(self, stuck: StuckOrder, result: CancelResult) -> None:
+        tracked = result.tracked
+        status_name = (
+            result.final_status.name if result.final_status is not None else "UNKNOWN"
+        )
+        body = (
+            f"orderID={tracked.order_id}  •  {tracked.action} {tracked.symbol}  •  "
+            f"waited {stuck.waited_seconds}s (in-session {stuck.in_session_seconds}s)\n"
+            f"final status: {status_name}\n"
+            f"reason: {result.detail}"
+        )
+        self._emit(
+            AlertType.ORDER_STUCK_CANT_CANCEL,
+            title=f"STUCK ORDER — {tracked.symbol} ({tracked.action})",
+            body=body,
+        )
 
     def _emit_trade_alerts(self, results: list[ExecutionResult]) -> None:
         for r in results:
