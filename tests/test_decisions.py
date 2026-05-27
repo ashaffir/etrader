@@ -20,7 +20,7 @@ class _FakeAi:
         self.raise_unavailable = raise_unavailable
         self.calls = 0
 
-    def chat_json(self, *, system: str, user: str, require_json: bool = True) -> AiCallResult:  # noqa: ARG002
+    def chat_json(self, *, system: str, user: str, require_json: bool = True, call_type: str = "unknown") -> AiCallResult:  # noqa: ARG002
         self.calls += 1
         if self.raise_unavailable:
             raise AzureUnavailable("test-down")

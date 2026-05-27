@@ -24,6 +24,7 @@ def build_decision_prompt(
     strategy_rules: Mapping[str, Any] | None = None,
     autotune_evidence: Mapping[str, Any] | None = None,
     performance: Mapping[str, Any] | None = None,
+    directives: Mapping[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Return ``(system, user)`` strings for the decision call.
 
@@ -38,9 +39,17 @@ def build_decision_prompt(
     :class:`src.strategy.autotune.AutotuneState.build_evidence`. The
     LLM uses it to decide whether to attach an OPTIONAL ``tuning``
     block to its response — see the system prompt for the schema.
+
+    ``directives`` is the operator-set persistent ruleset returned by
+    :meth:`BotController.snapshot_directives`. Hard rules (blocked
+    symbols, sectors, total-cap, etc.) are also enforced by the risk
+    layer; the LLM still sees them so it can avoid wasting BUY slots
+    on something the risk layer is going to reject, and so it can
+    weigh free-text ``notes`` for soft preferences.
     """
     user_payload = {
         "guardrails": dict(guardrails_summary),
+        "directives": dict(directives) if directives else None,
         "portfolio": dict(portfolio_summary),
         "bot_owned_positions": list(bot_owned_positions),
         "candidates": list(candidates),
@@ -51,15 +60,19 @@ def build_decision_prompt(
         "autotune_evidence": dict(autotune_evidence) if autotune_evidence else None,
         "instructions": (
             "Decide per-instrument actions covering BOTH new candidates AND "
-            "every existing bot-owned position. For each open position with "
-            "a non-empty `review.triggers`, emit CLOSE, MODIFY_STOPS, or HOLD "
-            "with explicit rationale. For new candidates use BUY (size with "
-            "`amount_usd`) or HOLD. Consult `performance.by_symbol` before "
-            "BUYing a symbol with a poor track record — either size down or "
-            "skip. Inspect `autotune_evidence`: if the rolling raw_score "
-            "distribution and drought counters indicate the entry gate is "
-            "mis-calibrated, include a `tuning` block per the schema. Most "
-            "cycles should omit it. Return strict JSON per schema."
+            "every existing bot-owned position. Honour every active operator "
+            "directive in `directives` — they are persistent rules the user "
+            "set explicitly; never propose a BUY that violates one and "
+            "respect the free-text `notes` as soft preferences. For each "
+            "open position with a non-empty `review.triggers`, emit CLOSE, "
+            "MODIFY_STOPS, or HOLD with explicit rationale. For new "
+            "candidates use BUY (size with `amount_usd`) or HOLD. Consult "
+            "`performance.by_symbol` before BUYing a symbol with a poor "
+            "track record — either size down or skip. Inspect "
+            "`autotune_evidence`: if the rolling raw_score distribution "
+            "and drought counters indicate the entry gate is mis-calibrated, "
+            "include a `tuning` block per the schema. Most cycles should "
+            "omit it. Return strict JSON per schema."
         ),
     }
     return _DECISION_SYSTEM, json.dumps(user_payload, indent=2, default=str)
@@ -142,6 +155,17 @@ CRITICAL invariant about WHICH positions are the bot's:
   numbers in `performance.bot`. If you want to also mention overall account state,
   label it explicitly: "Bot: X. Whole account incl. your manual trades: Y."
 
+CRITICAL invariant about OPERATOR DIRECTIVES:
+- The `directives` block lists PERSISTENT rules the user attached via Telegram. Honour
+  them in your answers and decisions: when asked "why didn't the bot buy NVDA?" check
+  `directives.values.blocked_symbols` first; when asked "will positions stay open
+  overnight?" check `directives.values.no_overnight`.
+- The free-text `directives.values.notes` field is the operator talking directly to
+  you. Quote it (or paraphrase) when answering questions like "any preferences from
+  the operator?" — it is the source of truth for soft directives.
+- Directives are persistent across bot restarts. Mention them when explaining recent
+  refusals or scheduled closes.
+
 CRITICAL invariant about P/L numbers:
 - The `performance` block (when present) contains pre-computed bot-attributable
   P/L over multiple windows (today, 7d, 30d, all-time). Use these directly.
@@ -172,6 +196,7 @@ def build_qa_prompt(
     bot_snapshot: Mapping[str, Any],
     strategy_rules: Mapping[str, Any] | None = None,
     performance: Mapping[str, Any] | None = None,
+    directives: Mapping[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Return ``(system, user)`` strings for a Q&A turn.
 
@@ -199,6 +224,7 @@ def build_qa_prompt(
         "bot_state": bot_state,
         "strategy_rules": dict(strategy_rules) if strategy_rules else None,
         "performance": dict(performance) if performance else None,
+        "directives": dict(directives) if directives else None,
     }
     return _QA_SYSTEM, json.dumps(payload, indent=2, default=str)
 

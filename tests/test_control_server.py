@@ -35,6 +35,7 @@ from src.control.controller import BotController
 from src.control.server import ControlHTTPServer
 from src.persistence import StatePersistence
 from src.state import BotState
+from src.strategy.directives import DirectivesStore
 from src.telemetry import TelemetryStore
 from src.trade_history import TradeHistoryLog
 
@@ -300,6 +301,95 @@ class ControlServerTests(unittest.TestCase):
         )
         assert body2 is not None
         self.assertEqual(body2["alerts"], [])
+
+    # ----- /directives + /tokens endpoints -----------------------------------
+
+    def test_directives_get_unwired_returns_disabled(self) -> None:
+        st, body = _http_get(
+            f"{self.base}/directives", token="secret-token-test",
+        )
+        self.assertEqual(st, 200)
+        assert body is not None
+        self.assertFalse(body["enabled"])
+
+    def test_directives_set_unwired_returns_500(self) -> None:
+        # Without the store wired, set_directive raises ControllerError
+        # which the HTTP layer maps to a 500.
+        st, _ = _http_post(
+            f"{self.base}/directives",
+            token="secret-token-test",
+            body={"key": "no_overnight", "value": "true"},
+        )
+        self.assertIn(st, (400, 500))
+
+    def test_directives_full_round_trip(self) -> None:
+        self.controller.set_directives_store(DirectivesStore())
+
+        # Set a directive.
+        st, body = _http_post(
+            f"{self.base}/directives",
+            token="secret-token-test",
+            body={"key": "no_overnight", "value": "true"},
+        )
+        self.assertEqual(st, 200)
+        assert body is not None
+        self.assertTrue(body["current"])
+        self.assertFalse(body["previous"])
+
+        # GET reflects.
+        st2, body2 = _http_get(
+            f"{self.base}/directives", token="secret-token-test",
+        )
+        self.assertEqual(st2, 200)
+        assert body2 is not None
+        self.assertTrue(body2["enabled"])
+        self.assertTrue(body2["values"]["no_overnight"])
+
+        # Clear.
+        st3, body3 = _http_post(
+            f"{self.base}/directives/clear",
+            token="secret-token-test",
+            body={"key": "no_overnight"},
+        )
+        self.assertEqual(st3, 200)
+        assert body3 is not None
+        self.assertTrue(body3["previous"])
+        self.assertFalse(body3["current"])
+
+    def test_directives_set_missing_key_400(self) -> None:
+        self.controller.set_directives_store(DirectivesStore())
+        st, _ = _http_post(
+            f"{self.base}/directives",
+            token="secret-token-test",
+            body={"value": "true"},
+        )
+        self.assertEqual(st, 400)
+
+    def test_directives_note_round_trip(self) -> None:
+        self.controller.set_directives_store(DirectivesStore())
+        st, body = _http_post(
+            f"{self.base}/directives/note",
+            token="secret-token-test",
+            body={"text": "watch financials"},
+        )
+        self.assertEqual(st, 200)
+        assert body is not None
+        self.assertEqual(body["current"], "watch financials")
+
+        st2, body2 = _http_post(
+            f"{self.base}/directives/note/clear",
+            token="secret-token-test",
+            body={},
+        )
+        self.assertEqual(st2, 200)
+        assert body2 is not None
+        self.assertEqual(body2["previous"], "watch financials")
+
+    def test_tokens_endpoint_unwired_disabled(self) -> None:
+        st, body = _http_get(f"{self.base}/tokens", token="secret-token-test")
+        self.assertEqual(st, 200)
+        assert body is not None
+        self.assertFalse(body["enabled"])
 
 
 if __name__ == "__main__":

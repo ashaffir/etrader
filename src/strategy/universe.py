@@ -453,7 +453,10 @@ class UniverseBuilder:
             market_context=context,
         )
         try:
-            result = self._ai.chat_json(system=system, user=user, require_json=True)
+            result = self._ai.chat_json(
+                system=system, user=user, require_json=True,
+                call_type="universe_rotation",
+            )
         except AzureUnavailable as exc:
             self._log.warning("[universe] LLM rotation unavailable: %s", exc)
             return []

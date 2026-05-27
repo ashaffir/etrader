@@ -41,6 +41,11 @@ from .execution.executor import ExecutionResult, TradeExecutor
 from .execution.monitor import PositionMonitor
 from .execution.stuck_orders import CancelResult, StuckOrder
 from .performance import PerformanceTracker
+from .strategy.directive_enforcer import (
+    build_directive_close_requests,
+    prescreen_candidates,
+)
+from .strategy.directives import Directives, DirectivesStore
 from .strategy.position_review import PositionReviewer
 from .strategy.tools.base import AssetClass, asset_class_for
 from .fundamentals import FundamentalsCache
@@ -100,6 +105,7 @@ class CycleRunner:
         performance: PerformanceTracker | None = None,
         dynamic_stops: "DynamicStopsStore | None" = None,
         position_reviewer: "PositionReviewer | None" = None,
+        directives_store: "DirectivesStore | None" = None,
         stop_event: threading.Event | None = None,
     ) -> None:
         self._cfg = cfg
@@ -138,6 +144,13 @@ class CycleRunner:
         # breached drawdown / pullback / stale-hold / max-hold so the
         # decision LLM is forced to attend to them this cycle.
         self._position_reviewer = position_reviewer
+        # Persistent operator directives (hybrid structured + free-text
+        # notes). The cycle prescreens candidates and emits directive-
+        # driven CLOSEs (no_overnight / hold_ceiling); the risk
+        # evaluator enforces hard structured rules; the LLM prompt
+        # surfaces them so the manager honours both hard and soft
+        # parts. ``None`` keeps every directive disabled.
+        self._directives_store = directives_store
         # Optional stop signal so synchronous I/O in the cycle can be
         # short-circuited mid-flight. Set by the SIGINT/SIGTERM handler.
         self._stop_event = stop_event
@@ -214,6 +227,24 @@ class CycleRunner:
             symbol_for_id=ctx.universe.symbol_for_id,
             bot_owned_instrument_ids={p.instrument_id for p in bot_owned_positions},
         )
+
+        directives = self._directives()
+        if directives.blocked_symbols or directives.blocked_sectors:
+            kept, dropped = prescreen_candidates(
+                directives=directives,
+                candidates=candidates,
+                fundamentals_lookup=(
+                    self._fundamentals.get if self._fundamentals is not None else None
+                ),
+            )
+            if dropped:
+                self._log.info(
+                    "[directives] dropped %d candidate(s): %s",
+                    len(dropped),
+                    ", ".join(f"{s}({r})" for s, r in dropped),
+                )
+            candidates = kept
+
         self._log.info(
             "[signals] %d candidate(s): %s",
             len(candidates),
@@ -309,6 +340,7 @@ class CycleRunner:
             performance=performance_block,
             enriched_owned_positions=enriched_owned,
             position_units_by_id=position_units,
+            directives=directives.to_dict(),
         )
         latency_str = f", {decision.latency_ms} ms" if decision.latency_ms is not None else ""
         self._log.info(
@@ -330,12 +362,50 @@ class CycleRunner:
         self._apply_autotune(decision)
 
         bot_invested_total = sum(p.amount for p in bot_owned_positions)
+        account_invested_total = float(summary.get("total_invested") or 0.0)
+        directive_closes, directive_close_notes = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=bot_owned_positions,
+            symbol_for_id=ctx.universe.symbol_for_id,
+            instrument_metas=ctx.instrument_metas,
+            open_states=(
+                self._performance.open_states_by_position()
+                if self._performance else {}
+            ),
+            now=datetime.now(timezone.utc),
+        )
+        # Drop any LLM-emitted action that targets a position we're
+        # already directive-closing (so we don't double-close and
+        # never emit BUY for instruments whose existing position is
+        # being flattened).
+        if directive_close_notes:
+            forced_pids = {int(n["position_id"]) for n in directive_close_notes}
+            forced_inst = {int(n["instrument_id"]) for n in directive_close_notes}
+            kept_requests = [
+                r for r in decision.requests
+                if not (
+                    (r.position_id is not None and int(r.position_id) in forced_pids)
+                    or (r.action == "BUY" and int(r.instrument_id) in forced_inst)
+                )
+            ]
+            self._log.info(
+                "[directives] auto-CLOSE %d position(s): %s",
+                len(directive_close_notes),
+                ", ".join(
+                    f"{n['symbol']}({n['directive']})" for n in directive_close_notes
+                ),
+            )
+            all_requests = kept_requests + directive_closes
+        else:
+            all_requests = list(decision.requests)
+
         verdicts = self._risk.evaluate(
-            requests=decision.requests,
+            requests=all_requests,
             state=self._state,
             current_equity=summary.get("equity"),
             bot_owned_position_count=len(bot_owned_positions),
             bot_invested_total_usd=bot_invested_total,
+            account_invested_total_usd=account_invested_total,
         )
         # Risk evaluation flips state.halted_today; capture the edge and
         # alert the operator the FIRST time we trip the kill switch today.
@@ -664,6 +734,12 @@ class CycleRunner:
             perf_open_states=open_states,
             live_rates=rate_cache,
         )
+
+    def _directives(self) -> Directives:
+        """Return the live directives snapshot (or an all-default one)."""
+        if self._directives_store is None:
+            return Directives()
+        return self._directives_store.current()
 
     def _build_by_symbol_projection(
         self,

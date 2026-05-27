@@ -174,3 +174,25 @@ class ControlAPIClient:
             "GET",
             f"/alerts/pending?chat_id={int(chat_id)}&limit={limit}",
         )
+
+    # -- directives -----------------------------------------------------
+
+    def directives(self) -> dict[str, Any]:
+        return self._request("GET", "/directives")
+
+    def set_directive(self, key: str, value: Any) -> dict[str, Any]:
+        return self._request("POST", "/directives", body={"key": key, "value": value})
+
+    def clear_directive(self, key: str) -> dict[str, Any]:
+        return self._request("POST", "/directives/clear", body={"key": key})
+
+    def set_directive_note(self, text: str) -> dict[str, Any]:
+        return self._request("POST", "/directives/note", body={"text": text})
+
+    def clear_directive_note(self) -> dict[str, Any]:
+        return self._request("POST", "/directives/note/clear")
+
+    # -- tokens / cost --------------------------------------------------
+
+    def tokens(self) -> dict[str, Any]:
+        return self._request("GET", "/tokens")

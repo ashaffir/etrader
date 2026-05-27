@@ -9,10 +9,11 @@ trivial to write.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 from ..config import GuardrailsConfig
 from ..state import BotState
+from .directives import Directives
 from .kill_switch import update_and_check_kill_switch
 
 
@@ -64,6 +65,12 @@ class TradeVerdict:
 @dataclass
 class RiskEvaluator:
     cfg: GuardrailsConfig
+    # Optional resolver for the operator-directives snapshot. Kept as
+    # a callable (instead of a stored ``Directives``) so the evaluator
+    # always reads the *latest* directives even when the operator
+    # edits them between cycles. The default returns a no-op snapshot
+    # so legacy call sites (and tests) keep working unchanged.
+    directives_provider: Callable[[], Directives] | None = None
 
     def evaluate(
         self,
@@ -73,6 +80,7 @@ class RiskEvaluator:
         current_equity: float | None,
         bot_owned_position_count: int,
         bot_invested_total_usd: float = 0.0,
+        account_invested_total_usd: float = 0.0,
     ) -> list[TradeVerdict]:
         # Daily-loss kill switch first — this gates every BUY this cycle.
         kill_switch_active = self._update_and_check_kill_switch(
@@ -81,6 +89,10 @@ class RiskEvaluator:
             bot_owned_position_count=bot_owned_position_count,
         )
 
+        directives = (
+            self.directives_provider() if self.directives_provider is not None
+            else Directives()
+        )
         verdicts: list[TradeVerdict] = []
         new_open_count = 0
         invested_this_cycle: float = 0.0
@@ -94,6 +106,8 @@ class RiskEvaluator:
                     bot_invested_total_usd=bot_invested_total_usd,
                     invested_this_cycle=invested_this_cycle,
                     kill_switch_active=kill_switch_active,
+                    directives=directives,
+                    account_invested_total_usd=account_invested_total_usd,
                 )
                 if v.approved:
                     new_open_count += 1
@@ -122,9 +136,16 @@ class RiskEvaluator:
         bot_invested_total_usd: float,
         invested_this_cycle: float,
         kill_switch_active: bool,
+        directives: Directives,
+        account_invested_total_usd: float,
     ) -> TradeVerdict:
         if kill_switch_active:
             return TradeVerdict(req, False, "daily-loss kill switch active")
+        if directives.is_symbol_blocked(req.symbol):
+            return TradeVerdict(
+                req, False,
+                f"directive blocked_symbols: {req.symbol}",
+            )
         if bot_owned_count + new_open_count >= self.cfg.max_parallel_trades:
             return TradeVerdict(
                 req,
@@ -159,6 +180,19 @@ class RiskEvaluator:
         if budget_reason is not None:
             return TradeVerdict(req, False, budget_reason)
 
+        # Third clamp: account-wide total-invested directive (bot +
+        # manual + mirror). Refuses new buys (does NOT close manual
+        # positions). 0 = disabled.
+        amount, amended, account_reason = self._apply_account_total_cap(
+            directives=directives,
+            account_invested_total_usd=account_invested_total_usd,
+            invested_this_cycle=invested_this_cycle,
+            amount=amount,
+            amended=amended,
+        )
+        if account_reason is not None:
+            return TradeVerdict(req, False, account_reason)
+
         return TradeVerdict(
             req,
             True,
@@ -166,6 +200,43 @@ class RiskEvaluator:
             + ("" if amended is None else f", capped from ${req.amount_usd:.2f}"),
             amended_amount_usd=amended,
         )
+
+    def _apply_account_total_cap(
+        self,
+        *,
+        directives: Directives,
+        account_invested_total_usd: float,
+        invested_this_cycle: float,
+        amount: float,
+        amended: float | None,
+    ) -> tuple[float, float | None, str | None]:
+        """Apply the operator's ``max_total_account_invested_usd`` directive.
+
+        Unlike ``max_bot_invested_usd``, this includes the user's
+        manual + mirror positions. The intent is to act as a TOTAL
+        portfolio brake on new BUYs — the bot still refuses to close
+        manual positions, but it won't push the account further past
+        a ceiling the operator has set. 0 = disabled.
+        """
+        cap = float(getattr(directives, "max_total_account_invested_usd", 0.0))
+        if cap <= 0:
+            return amount, amended, None
+        already_committed = float(account_invested_total_usd) + float(invested_this_cycle)
+        headroom = cap - already_committed
+        if headroom <= 0:
+            return amount, amended, (
+                f"directive max_total_account_invested_usd exhausted "
+                f"(${already_committed:.2f} / ${cap:.2f})"
+            )
+        if amount <= headroom:
+            return amount, amended, None
+        floor = float(self.cfg.min_amend_remainder_usd)
+        if headroom < floor:
+            return amount, amended, (
+                f"directive max_total_account_invested_usd would leave only "
+                f"${headroom:.2f} headroom (< ${floor:.2f} amend floor); rejecting"
+            )
+        return headroom, headroom, None
 
     def _apply_budget_cap(
         self,

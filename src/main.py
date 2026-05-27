@@ -22,6 +22,7 @@ import traceback
 from pathlib import Path
 
 from .ai.azure_client import AzureFoundryClient, AzureUnavailable
+from .ai.usage_tracker import LLMUsageTracker
 from .alerts import AlertHub, AlertSubscriptions, safety_only_default
 from .config import AppConfig, DEFAULT_CONFIG_DB_PATH, PROJECT_ROOT, load_config, summarize_config
 from .config_store import ConfigStore, open_store
@@ -45,6 +46,7 @@ from .state import BotState
 from .strategy.activity_filter import ActivityFilter
 from .strategy.autotune import AutotuneState
 from .strategy.decisions import DecisionEngine
+from .strategy.directives import Directives, DirectivesStore
 from .strategy.position_review import PositionReviewer, PositionReviewConfig
 from .strategy.risk import RiskEvaluator
 from .strategy.tool_orchestration import ToolOrchestrator
@@ -88,6 +90,9 @@ class TradingBot:
             logger=get_logger("etoro.client", tag="etoro"),
         )
         self._ai_client: AzureFoundryClient | None = self._build_ai_client()
+        self._usage_tracker = self._build_usage_tracker()
+        if self._ai_client is not None and self._usage_tracker is not None:
+            self._ai_client.set_usage_tracker(self._usage_tracker)
         self.telemetry = TelemetryStore()
         self.history = TradeHistoryLog(
             project_root / "data" / "trade_history.jsonl",
@@ -132,6 +137,25 @@ class TradingBot:
             stale_threshold_pct=float(pr_dc.stale_threshold_pct) if pr_dc else 0.5,
             max_hold_minutes=float(pr_dc.max_hold_minutes) if pr_dc else 240.0,
         )
+        self._directives_store = DirectivesStore(
+            logger=get_logger("strategy.directives", tag="directives"),
+        )
+        persisted_directives = self._persistence.load_directives()
+        if persisted_directives:
+            self._directives_store.restore(persisted_directives)
+            self.log.info(
+                "[directives] restored: no_overnight=%s hold_ceiling=%dm "
+                "blocked_symbols=%d blocked_sectors=%d total_cap=$%.0f notes=%d chars",
+                self._directives_store.current().no_overnight,
+                self._directives_store.current().hold_ceiling_minutes,
+                len(self._directives_store.current().blocked_symbols),
+                len(self._directives_store.current().blocked_sectors),
+                self._directives_store.current().max_total_account_invested_usd,
+                len(self._directives_store.current().notes),
+            )
+        self.controller.set_directives_store(self._directives_store)
+        if self._usage_tracker is not None:
+            self.controller.set_token_usage_tracker(self._usage_tracker)
         self._control_server = self._maybe_start_control_server()
         self._runner = self._build_runner()
 
@@ -217,7 +241,10 @@ class TradingBot:
     # ------------------------------------------------------------------
 
     def _build_runner(self) -> CycleRunner:
-        risk = RiskEvaluator(self.cfg.guardrails)
+        risk = RiskEvaluator(
+            self.cfg.guardrails,
+            directives_provider=self._directives_store.current,
+        )
         dynamic_stops = DynamicStopsStore(
             default_stop_loss_pct=self.cfg.guardrails.default_stop_loss_pct,
             default_take_profit_pct=self.cfg.guardrails.default_take_profit_pct,
@@ -281,6 +308,7 @@ class TradingBot:
             performance=self._performance,
             dynamic_stops=dynamic_stops,
             position_reviewer=position_reviewer,
+            directives_store=self._directives_store,
             stop_event=self._stop_event,
             log=get_logger("cycle", tag="cycle"),
         )
@@ -386,6 +414,21 @@ class TradingBot:
             cfg=self.cfg,
             etoro=self._etoro,
             logger=get_logger("strategy.tools", tag="tools"),
+        )
+
+    def _build_usage_tracker(self) -> LLMUsageTracker | None:
+        """Construct the LLM usage tracker if AI is available.
+
+        Falls back gracefully when AI isn't configured — `/tokens`
+        will then report ``enabled=false`` and the Telegram surface
+        explains why.
+        """
+        if not self.cfg.azure.is_configured:
+            return None
+        return LLMUsageTracker(
+            self._project_root / "data" / "llm_usage.jsonl",
+            deployment=self.cfg.azure.deployment or "",
+            logger=get_logger("ai.usage_tracker", tag="ai"),
         )
 
     def _build_ai_client(self) -> AzureFoundryClient | None:

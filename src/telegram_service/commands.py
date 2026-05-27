@@ -27,6 +27,12 @@ from .channel_formatter import (
     parse_channels_args,
 )
 from .control_client import ControlAPIClient, ControlAPIError
+from .directives_formatter import (
+    format_clear_result as format_directive_clear,
+    format_directives,
+    format_note_result,
+    format_set_result as format_directive_set,
+)
 from .formatters import (
     format_fundamentals,
     format_guardrails,
@@ -39,6 +45,7 @@ from .formatters import (
     format_status,
     format_universe,
 )
+from .tokens_formatter import format_tokens
 from .stats_formatter import (
     format_by_symbol as format_stats_by_symbol,
     format_closed as format_stats_closed,
@@ -251,6 +258,83 @@ def _h_alerts(ctx: CommandContext) -> CommandReply:
     )
 
 
+def _h_directives(ctx: CommandContext) -> str:
+    return format_directives(ctx.api.directives())
+
+
+def _h_directive(ctx: CommandContext) -> str:
+    """``/directive set|clear <key> [value]`` — edit one directive."""
+    parts = ctx.cmd.args.split(maxsplit=2)
+    if not parts:
+        return _directive_usage()
+    sub = parts[0].lower()
+    if sub == "set":
+        if len(parts) < 3:
+            return _directive_usage()
+        key, raw_value = parts[1].strip(), parts[2].strip()
+        result = ctx.api.set_directive(key, raw_value)
+        return format_directive_set(result)
+    if sub == "clear":
+        if len(parts) < 2:
+            return _directive_usage()
+        key = parts[1].strip()
+        result = ctx.api.clear_directive(key)
+        return format_directive_clear(result)
+    return _directive_usage()
+
+
+def _directive_usage() -> str:
+    return (
+        "Usage:\n"
+        "  /directive set <key> <value>\n"
+        "  /directive clear <key>\n\n"
+        "Known keys: no_overnight, hold_ceiling_minutes, blocked_symbols,\n"
+        "            blocked_sectors, max_total_account_invested_usd\n\n"
+        "Examples:\n"
+        "  /directive set no_overnight true\n"
+        "  /directive set blocked_symbols NVDA,TSLA\n"
+        "  /directive set hold_ceiling_minutes 120\n"
+        "  /directive clear blocked_symbols"
+    )
+
+
+def _h_note(ctx: CommandContext) -> str:
+    """``/note add|set|clear [text]`` — edit the free-text directive."""
+    raw = ctx.cmd.args.strip()
+    if not raw:
+        return _note_usage()
+    head, _, rest = raw.partition(" ")
+    sub = head.lower()
+    if sub == "clear":
+        result = ctx.api.clear_directive_note()
+        return format_note_result(result, cleared=True)
+    if sub in {"add", "set"}:
+        text = rest.strip()
+        if not text:
+            return _note_usage()
+        result = ctx.api.set_directive_note(text)
+        return format_note_result(result, cleared=False)
+    # No sub-command given — treat the entire arg as the new note text.
+    result = ctx.api.set_directive_note(raw)
+    return format_note_result(result, cleared=False)
+
+
+def _note_usage() -> str:
+    return (
+        "Usage:\n"
+        "  /note add <text>     — replace the current note\n"
+        "  /note set <text>     — alias of add\n"
+        "  /note clear          — remove the current note\n\n"
+        "Notes are surfaced to the manager LLM in every cycle prompt; "
+        "use them for soft preferences the structured directive schema "
+        "doesn't capture."
+    )
+
+
+def _h_tokens(ctx: CommandContext) -> str:
+    return format_tokens(ctx.api.tokens())
+
+
 def _h_stats(ctx: CommandContext) -> CommandReply:
     """``/stats [view]`` — performance dashboard.
 
@@ -350,4 +434,12 @@ _COMMANDS: dict[str, CommandHandler] = {
     "stats": _h_stats,
     "performance": _h_stats,     # alias
     "perf": _h_stats,            # alias
+    "directives": _h_directives,
+    "directive": _h_directive,
+    "rules_persistent": _h_directives,  # readable alias
+    "note": _h_note,
+    "notes": _h_note,           # alias
+    "tokens": _h_tokens,
+    "cost": _h_tokens,          # alias
+    "usage": _h_tokens,         # alias
 }

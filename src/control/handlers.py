@@ -155,6 +155,58 @@ def _stats_daily(c: BotController, _body, q: Mapping[str, str]) -> tuple[int, An
     return 200, c.snapshot_performance_dailies(limit=limit)
 
 
+# ---------------------------------------------------------------------------
+# Operator directives
+# ---------------------------------------------------------------------------
+
+def _directives_get(c: BotController, _body, _q) -> tuple[int, Any]:
+    return 200, c.snapshot_directives()
+
+
+def _directives_set(
+    c: BotController, body: Mapping[str, Any] | None, _q,
+) -> tuple[int, Any]:
+    body = body or {}
+    key = body.get("key")
+    if not isinstance(key, str) or not key.strip():
+        raise ControllerError("body must include 'key' (string)")
+    if "value" not in body:
+        raise ControllerError("body must include 'value'")
+    return 200, c.set_directive(key.strip(), body.get("value"))
+
+
+def _directives_clear(
+    c: BotController, body: Mapping[str, Any] | None, _q,
+) -> tuple[int, Any]:
+    body = body or {}
+    key = body.get("key")
+    if not isinstance(key, str) or not key.strip():
+        raise ControllerError("body must include 'key' (string)")
+    return 200, c.clear_directive(key.strip())
+
+
+def _directives_note_set(
+    c: BotController, body: Mapping[str, Any] | None, _q,
+) -> tuple[int, Any]:
+    body = body or {}
+    text = body.get("text")
+    if text is None:
+        raise ControllerError("body must include 'text' (string)")
+    return 200, c.set_directive_note(str(text))
+
+
+def _directives_note_clear(c: BotController, _body, _q) -> tuple[int, Any]:
+    return 200, c.clear_directive_note()
+
+
+# ---------------------------------------------------------------------------
+# LLM token usage
+# ---------------------------------------------------------------------------
+
+def _tokens_get(c: BotController, _body, _q) -> tuple[int, Any]:
+    return 200, c.snapshot_token_usage()
+
+
 def _news_channels(c: BotController, _body, _q) -> tuple[int, Any]:
     """``GET /news/channels`` — per-source health overview."""
     return 200, c.snapshot_news_channels()
@@ -278,4 +330,10 @@ def build_route_table() -> RouteTable:
     rt.add("GET", "/alerts/subscriptions", _alerts_subscriptions_get)
     rt.add("POST", "/alerts/subscriptions", _alerts_subscriptions_set)
     rt.add("GET", "/alerts/pending", _alerts_pending)
+    rt.add("GET", "/directives", _directives_get)
+    rt.add("POST", "/directives", _directives_set)
+    rt.add("POST", "/directives/clear", _directives_clear)
+    rt.add("POST", "/directives/note", _directives_note_set)
+    rt.add("POST", "/directives/note/clear", _directives_note_clear)
+    rt.add("GET", "/tokens", _tokens_get)
     return rt

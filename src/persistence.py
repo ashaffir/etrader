@@ -42,6 +42,7 @@ def _state_to_dict(
     paused: bool,
     autotune_payload: dict | None = None,
     dynamic_stops_payload: dict | None = None,
+    directives_payload: dict | None = None,
 ) -> dict:
     now_mono = time.monotonic()
     now_wall = time.time()
@@ -67,6 +68,8 @@ def _state_to_dict(
         out["autotune"] = autotune_payload
     if dynamic_stops_payload is not None:
         out["dynamic_stops"] = dynamic_stops_payload
+    if directives_payload is not None:
+        out["directives"] = directives_payload
     return out
 
 
@@ -129,14 +132,17 @@ class StatePersistence:
         paused: bool,
         autotune_payload: dict | None = None,
         dynamic_stops_payload: dict | None = None,
+        directives_payload: dict | None = None,
     ) -> None:
         """Persist ``state`` atomically. Logs and swallows any I/O error.
 
         ``autotune_payload`` is the serialised :class:`AutotuneState`
         snapshot. ``dynamic_stops_payload`` is the per-position SL/TP
-        override map from :class:`DynamicStopsStore`. Both are
-        optional so legacy call sites that don't know about them
-        continue to work — the corresponding block is simply omitted.
+        override map from :class:`DynamicStopsStore`.
+        ``directives_payload`` is the operator-directives snapshot
+        from :class:`DirectivesStore`. All are optional so legacy
+        call sites that don't know about them continue to work — the
+        corresponding block is simply omitted.
         """
         self._path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -146,6 +152,7 @@ class StatePersistence:
                 paused=paused,
                 autotune_payload=autotune_payload,
                 dynamic_stops_payload=dynamic_stops_payload,
+                directives_payload=directives_payload,
             )
             tmp.write_text(
                 json.dumps(payload, indent=2),
@@ -158,6 +165,10 @@ class StatePersistence:
     def load_dynamic_stops(self) -> dict | None:
         """Return the persisted dynamic-stops block, or None."""
         return self._load_block("dynamic_stops")
+
+    def load_directives(self) -> dict | None:
+        """Return the persisted operator-directives block, or None."""
+        return self._load_block("directives")
 
     def load_autotune(self) -> dict | None:
         """Return the persisted autotune block from the state file, or None."""

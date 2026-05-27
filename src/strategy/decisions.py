@@ -72,6 +72,7 @@ class DecisionEngine:
         performance: Mapping[str, Any] | None = None,
         enriched_owned_positions: Sequence[Mapping[str, Any]] | None = None,
         position_units_by_id: Mapping[int, float] | None = None,
+        directives: Mapping[str, Any] | None = None,
     ) -> DecisionResult:
         tool_results = tool_results or {}
 
@@ -101,6 +102,7 @@ class DecisionEngine:
                     autotune_evidence=autotune_evidence,
                     performance=performance,
                     enriched_owned_positions=enriched_owned_positions,
+                    directives=directives,
                 )
                 requests = parse_actions(
                     ai_result.parsed_json,
@@ -160,6 +162,7 @@ class DecisionEngine:
         autotune_evidence: Mapping[str, Any] | None,
         performance: Mapping[str, Any] | None = None,
         enriched_owned_positions: Sequence[Mapping[str, Any]] | None = None,
+        directives: Mapping[str, Any] | None = None,
     ) -> AiCallResult:
         assert self._ai_client is not None
         # Prefer the cycle's enriched view (MFE/MAE/time_held/stops/review)
@@ -205,8 +208,11 @@ class DecisionEngine:
             strategy_rules=strategy_rules,
             autotune_evidence=autotune_evidence,
             performance=performance,
+            directives=directives,
         )
-        return self._ai_client.chat_json(system=system, user=user, require_json=True)
+        return self._ai_client.chat_json(
+            system=system, user=user, require_json=True, call_type="decision",
+        )
 
     @staticmethod
     def _tuning_from_llm(parsed: Any) -> TuneRequest:

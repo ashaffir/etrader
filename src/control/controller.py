@@ -38,6 +38,13 @@ from ..etoro.trading import close_position_by_market, fetch_portfolio
 from ..news.channel_probe import probe_many
 from ..persistence import StatePersistence
 from ..state import BotState
+from ..strategy.directives import (
+    DirectiveError,
+    Directives,
+    DirectivesStore,
+    NOTES_MAX_CHARS,
+    STRUCTURED_KEYS,
+)
 from ..strategy.rules_summary import ToolDescription, build_rules_payload
 from ..telemetry import TelemetryStore
 from ..trade_history import TradeHistoryEntry, TradeHistoryLog, utc_now_iso
@@ -103,6 +110,8 @@ class BotController:
         self._autotune_state: Any | None = None
         self._performance: Any | None = None
         self._dynamic_stops: Any | None = None
+        self._directives: DirectivesStore | None = None
+        self._token_usage: Any | None = None
 
     # ------------------------------------------------------------------
     # Lock + pause primitives the cycle loop uses
@@ -154,6 +163,16 @@ class BotController:
         """Wire the per-position SL/TP store so persist_state can checkpoint it."""
         with self._lock:
             self._dynamic_stops = store
+
+    def set_directives_store(self, store: DirectivesStore) -> None:
+        """Wire the operator-directives store so Telegram can edit it."""
+        with self._lock:
+            self._directives = store
+
+    def set_token_usage_tracker(self, tracker: Any) -> None:
+        """Wire the LLM-usage tracker so /tokens can read its rollups."""
+        with self._lock:
+            self._token_usage = tracker
 
     def snapshot_performance(self) -> dict[str, Any]:
         """Return the structured performance payload for /stats and /ask.
@@ -400,6 +419,88 @@ class BotController:
             self._log.warning("[control] config persist failed (%s.%s): %s", section, key, exc)
 
     # ------------------------------------------------------------------
+    # Operator directives (persistent rules surfaced to the LLM)
+    # ------------------------------------------------------------------
+
+    def snapshot_directives(self) -> dict[str, Any]:
+        """Return the live directives snapshot for /directives + LLM context."""
+        with self._lock:
+            store = self._directives
+        if store is None:
+            return {
+                "enabled": False,
+                "structured_keys": list(STRUCTURED_KEYS),
+                "notes_max_chars": NOTES_MAX_CHARS,
+                "values": Directives().to_dict(),
+            }
+        return {
+            "enabled": True,
+            "structured_keys": list(STRUCTURED_KEYS),
+            "notes_max_chars": NOTES_MAX_CHARS,
+            "values": store.to_dict(),
+        }
+
+    def set_directive(self, key: str, value: Any) -> dict[str, Any]:
+        store = self._require_directives_store()
+        try:
+            previous, current = store.set_field(key, value)
+        except DirectiveError as exc:
+            raise ControllerError(str(exc)) from exc
+        with self._lock:
+            self.persist_state()
+        return {"key": key, "previous": previous, "current": current}
+
+    def clear_directive(self, key: str) -> dict[str, Any]:
+        store = self._require_directives_store()
+        try:
+            previous, current = store.clear_field(key)
+        except DirectiveError as exc:
+            raise ControllerError(str(exc)) from exc
+        with self._lock:
+            self.persist_state()
+        return {"key": key, "previous": previous, "current": current}
+
+    def set_directive_note(self, text: str) -> dict[str, Any]:
+        store = self._require_directives_store()
+        previous, current = store.set_notes(text or "")
+        with self._lock:
+            self.persist_state()
+        return {"previous": previous, "current": current}
+
+    def clear_directive_note(self) -> dict[str, Any]:
+        store = self._require_directives_store()
+        previous = store.clear_notes()
+        with self._lock:
+            self.persist_state()
+        return {"previous": previous, "current": ""}
+
+    def _require_directives_store(self) -> DirectivesStore:
+        with self._lock:
+            store = self._directives
+        if store is None:
+            raise ControllerError("directives store not wired (server starting up)")
+        return store
+
+    # ------------------------------------------------------------------
+    # LLM token usage
+    # ------------------------------------------------------------------
+
+    def snapshot_token_usage(self) -> dict[str, Any]:
+        """Return token / cost rollups for /tokens.
+
+        Falls back to ``{"enabled": False}`` when the usage tracker
+        isn't wired (e.g. AI disabled). The concrete shape lives in
+        :meth:`src.ai.usage_tracker.LLMUsageTracker.snapshot`.
+        """
+        with self._lock:
+            tracker = self._token_usage
+        if tracker is None:
+            return {"enabled": False}
+        payload = tracker.snapshot()
+        payload["enabled"] = True
+        return payload
+
+    # ------------------------------------------------------------------
     # AI Q&A
     # ------------------------------------------------------------------
 
@@ -432,16 +533,20 @@ class BotController:
             try:
                 performance_payload = self._performance.summary()
             except Exception as exc:  # noqa: BLE001
-                self._logger.warning("performance.summary() failed: %s", exc)
+                self._log.warning("performance.summary() failed: %s", exc)
 
+        directives_payload = self.snapshot_directives()
         system, user = build_qa_prompt(
             question=question,
             bot_snapshot=snapshot,
             strategy_rules=rules_payload,
             performance=performance_payload,
+            directives=directives_payload,
         )
         try:
-            result = self._ai.chat_json(system=system, user=user, require_json=False)
+            result = self._ai.chat_json(
+                system=system, user=user, require_json=False, call_type="qa",
+            )
         except AzureUnavailable as exc:
             raise ControllerError(f"LLM call failed: {exc}") from exc
         return {
@@ -754,12 +859,21 @@ class BotController:
                 self._log.warning(
                     "[control] dynamic-stops snapshot failed: %s", exc,
                 )
+        directives_payload: dict[str, Any] | None = None
+        if self._directives is not None:
+            try:
+                directives_payload = self._directives.to_persistable()
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning(
+                    "[control] directives snapshot failed: %s", exc,
+                )
         try:
             self._persistence.save(
                 self._state,
                 paused=self._paused,
                 autotune_payload=autotune_payload,
                 dynamic_stops_payload=dynamic_stops_payload,
+                directives_payload=directives_payload,
             )
         except Exception as exc:  # noqa: BLE001 - never let save kill us
             self._log.warning("[control] persist failed: %s", exc)
