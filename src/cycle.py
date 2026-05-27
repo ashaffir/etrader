@@ -424,6 +424,17 @@ class CycleRunner:
             verdicts=verdicts, rates=rates, state=self._state,
         )
         self._track_placed_orders(results, ctx)
+        # IMPORTANT: book bot-initiated CLOSE results into the
+        # performance tracker right here. The executor already removed
+        # the position from ``state.bot_owned_positions``, so the
+        # next-cycle ``_record_performance_vanished`` fallback would
+        # NEVER fire for it (the diff against the broker snapshot
+        # uses ``state.bot_owned_positions`` as the universe). Without
+        # this hook, every bot-initiated close leaks in ``_open``
+        # forever and never lands in ``closed_trades`` — which makes
+        # ``/stats`` show "0 closed trades" even though the bot is
+        # actively closing positions all day.
+        self._record_performance_closes(results)
         self._record_history(results)
         # Finalise this cycle's autotune snapshot with the actual
         # number of successful orders (BUY or CLOSE). Failed/skipped
@@ -1016,6 +1027,46 @@ class CycleRunner:
                 units=float(getattr(pos, "units", 0.0) or 0.0),
                 open_rate=float(pos.open_rate),
             )
+
+    def _record_performance_closes(
+        self, results: list[ExecutionResult],
+    ) -> None:
+        """Book successful bot-initiated CLOSE results as realized trades.
+
+        Called immediately after :meth:`TradeExecutor.execute_all` so
+        the PerformanceTracker observes every CLOSE the bot itself
+        issued (LLM-driven, synthetic SL/TP, directive-driven). Without
+        this hook the tracker would only see externally-closed
+        positions (manual / eToro SL hit) via
+        :meth:`_record_performance_vanished`, and bot-initiated closes
+        would silently disappear from /stats.
+
+        Partial closes are skipped: the position remains open on the
+        broker and gets re-marked-to-market next cycle. We only book
+        on full closes (``close_units is None``).
+        """
+        if self._performance is None or not results:
+            return
+        for r in results:
+            if r.action != "CLOSE" or r.status != "ok":
+                continue
+            if r.position_id is None:
+                continue
+            # Partial-close detection: the executor leaves the pid in
+            # ``state.bot_owned_positions`` on partial close (broker
+            # still has the remainder) and removes it on full close.
+            # That gives us a deterministic, single-source-of-truth
+            # signal that doesn't rely on string-parsing ``detail``.
+            if int(r.position_id) in self._state.bot_owned_positions:
+                continue
+            trade = self._performance.record_close(
+                position_id=int(r.position_id), reason="bot",
+            )
+            if trade is not None:
+                self._log.info(
+                    "[perf] booked bot-closed %s P/L=$%.2f",
+                    trade.symbol, trade.realized_pnl_usd,
+                )
 
     def _record_performance_vanished(self, snapshot: PortfolioSnapshot) -> None:
         """Detect bot-owned positions that vanished from the broker
