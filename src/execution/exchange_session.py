@@ -167,6 +167,57 @@ def exchange_label(meta: Any | None, asset_class: AssetClass) -> str:
     return schedule.label
 
 
+def resolve_exchange_label_for(
+    meta: Any | None,
+    symbol: str,
+) -> str | None:
+    """Return the exchange label for a (meta, symbol) pair, or ``None``
+    if the meta is missing entirely.
+
+    Thin wrapper that classifies the instrument via the same asset-class
+    helper used by the rest of the strategy code, so log lines, LLM
+    payloads, and ``no_overnight`` flatten decisions all label the
+    instrument identically.
+    """
+    if meta is None:
+        return None
+    # Lazy import — ``asset_class_for`` lives under ``strategy.tools``,
+    # which itself imports from ``execution``. Doing the import at
+    # module load creates a cycle.
+    from ..strategy.tools.base import asset_class_for
+
+    cls = asset_class_for(meta, symbol=symbol)
+    return exchange_label(meta, cls)
+
+
+def currently_open_exchange_labels(now: datetime | None = None) -> list[str]:
+    """Return the de-duplicated list of exchange labels that are *open*
+    in the equity sense at ``now`` (defaults to current UTC).
+
+    Used by the universe-rotation LLM call so it can bias nominations
+    toward markets the bot can actually trade right now. CRYPTO is
+    always included (24/7); FX is included on weekdays.
+
+    Implementation is intentionally a linear scan over the static
+    registry — there are ~20 entries and this is called at most once
+    per cycle.
+    """
+    now_utc = _to_utc(now if now is not None else datetime.now(timezone.utc))
+    seen: set[str] = set()
+    open_labels: list[str] = []
+    for sched in _EXCHANGE_HOURS.values():
+        if sched.label in seen:
+            continue
+        state = _exchange_state(now_utc, sched)
+        if state.is_open:
+            seen.add(sched.label)
+            open_labels.append(sched.label)
+    open_labels.append("CRYPTO")
+    if now_utc.weekday() < 5:
+        open_labels.append("FX")
+    return open_labels
+
+
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
@@ -272,7 +323,9 @@ def _seconds_since_midnight(now_utc: datetime) -> int:
 __all__ = [
     "ExchangeSchedule",
     "SessionState",
+    "currently_open_exchange_labels",
     "exchange_label",
+    "resolve_exchange_label_for",
     "session_for",
     "session_window_for",
 ]

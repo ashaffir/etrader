@@ -84,16 +84,40 @@ cancel_stuck_orders_enabled      = true
 # (see [news] below). Each candidate is probed for trading activity
 # (volatility + spread) before being admitted to the tracked set.
 #
-# `base_symbols` is now empty by default — operators who want a
-# guaranteed-tracked seed list can fill this in, but seeds still pass
-# through the activity filter.
+# `base_symbols` accepts plain US tickers (``AAPL``, ``NVDA``) AND
+# exchange-suffixed foreign tickers (``VOD.L``, ``ASML.AS``,
+# ``SAP.DE``, ``7203.T``, ``0700.HK``, ``BHP.AX``, …). The resolver
+# searches eToro's instrument catalogue, so any name eToro lists is
+# reachable. Seeds still pass through the activity filter.
+#
+# A starter cross-region list is provided below. The bot is only as
+# multi-market as the universe lets it be — once `base_symbols` has
+# foreign names, the LLM rotation, the activity filter, and the
+# decision LLM all start receiving them, and your bot can finally
+# trade outside US hours.
 #
 # `enable_llm_rotation` is kept as a *fallback* (used only when news
 # yields fewer than max_tracked passing candidates and the LLM is
 # configured). Symbols are resolved to instrument IDs once and
 # cached in `data/instrument_cache.json`.
 [universe]
-base_symbols          = []
+base_symbols          = [
+    # --- US large caps (pre-resolved in instrument_cache.json) ---
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META",
+    # --- UK (London Stock Exchange) ---
+    "VOD.L", "BP.L", "HSBA.L", "AZN.L", "SHEL.L", "GSK.L",
+    # --- Continental Europe ---
+    "ASML.AS",   # Amsterdam
+    "SAP.DE", "SIE.DE", "ALV.DE",  # XETRA
+    "MC.PA", "TTE.PA",  # Euronext Paris
+    # --- Asia ---
+    "7203.T", "6758.T",  # Toyota, Sony — Tokyo
+    "0700.HK", "9988.HK",  # Tencent, Alibaba — Hong Kong
+    # --- Australia ---
+    "BHP.AX", "CBA.AX",
+    # --- Crypto (24/7) ---
+    "BTC", "ETH", "SOL",
+]
 max_tracked           = 25
 enable_llm_rotation   = true
 
@@ -116,11 +140,16 @@ probe_max_candidates  = 50
 # out after `ttl_hours` of no new mentions. `enabled_sources` selects
 # the plug-ins to activate:
 #
-#   - "stocktwits"  → trending tickers (no key, no rate limit)
-#   - "sec_edgar"   → 8-K material-event filings (US-listed)
-#   - "google_news" → broad RSS, rotating finance queries
-#   - "yahoo_rss"   → per-ticker headlines, enrichment for tracked symbols
-#   - "yfinance"    → per-ticker news + co-mentioned `relatedTickers`
+#   - "stocktwits"          → trending tickers (no key, no rate limit) — US-leaning
+#   - "sec_edgar"           → 8-K material-event filings (US-listed only)
+#   - "google_news"         → US-edition broad finance RSS, rotating queries
+#   - "google_news_regional"→ UK/DE/FR/JP/HK/AU editions of Google News (one
+#                             feed per region) — required for non-US ticker
+#                             nominations; pair it with the foreign seeds in
+#                             [universe].base_symbols so the ticker extractor
+#                             has the right vocab.
+#   - "yahoo_rss"           → per-ticker headlines, enrichment for tracked symbols
+#   - "yfinance"            → per-ticker news + co-mentioned `relatedTickers`
 #
 # Per-source caps below keep API usage modest. Phase 2 wires the
 # universe builder to consume the candidate store; for phase 1 these
@@ -131,7 +160,11 @@ scan_interval_minutes            = 60
 ttl_hours                        = 24
 candidate_store_path             = "data/news_candidates.json"
 half_life_hours                  = 6.0
-enabled_sources                  = ["stocktwits", "sec_edgar", "google_news", "yahoo_rss", "yfinance"]
+enabled_sources                  = [
+    "stocktwits", "sec_edgar",
+    "google_news", "google_news_regional",
+    "yahoo_rss", "yfinance",
+]
 google_news_max_items_per_query  = 25
 yahoo_rss_max_symbols            = 50
 yahoo_rss_max_items_per_symbol   = 10

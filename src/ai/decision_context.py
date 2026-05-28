@@ -15,6 +15,8 @@ import time
 from datetime import datetime
 from typing import Any, Mapping, Sequence
 
+from ..execution.exchange_session import resolve_exchange_label_for
+
 
 def enrich_owned_position(
     *,
@@ -23,6 +25,7 @@ def enrich_owned_position(
     open_state: Any | None,
     dynamic_band: Any | None,
     review: Any | None,
+    meta: Any | None = None,
     now_epoch: float | None = None,
 ) -> dict[str, Any]:
     """Return a single bot-owned-position dict for the LLM payload.
@@ -30,8 +33,9 @@ def enrich_owned_position(
     Always includes broker-side fields. Augments with tracker fields
     (MFE/MAE/time held / pct) when ``open_state`` is provided, with
     the active dynamic SL/TP band when ``dynamic_band`` is provided,
-    and with the review annotation (triggers + notes) when ``review``
-    is provided.
+    the review annotation (triggers + notes) when ``review`` is
+    provided, and the resolved exchange when ``meta`` is provided
+    (eToro :class:`InstrumentMeta` carrying ``price_source``).
     """
     now = float(now_epoch if now_epoch is not None else time.time())
     out: dict[str, Any] = {
@@ -42,6 +46,7 @@ def enrich_owned_position(
         "open_rate": float(position.open_rate or 0.0),
         "pnl_usd": float(position.pnl or 0.0),
         "is_buy": bool(position.is_buy),
+        "exchange": resolve_exchange_label_for(meta, symbol),
     }
     if open_state is not None:
         opened_iso = str(getattr(open_state, "opened_at_iso", "") or "")
@@ -88,11 +93,18 @@ def project_bot_owned_positions(
     open_states: Mapping[int, Any] | None = None,
     dynamic_stops: Any | None = None,
     reviews_by_position_id: Mapping[int, Any] | None = None,
+    instrument_metas: Mapping[int, Any] | None = None,
     now_epoch: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Build the ``bot_owned_positions`` block for the decision prompt."""
+    """Build the ``bot_owned_positions`` block for the decision prompt.
+
+    ``instrument_metas`` (optional) is the cycle's ``ctx.instrument_metas``
+    map — when supplied every position carries an ``exchange`` label so
+    the LLM can reason about session timing per market.
+    """
     open_map = dict(open_states or {})
     review_map = dict(reviews_by_position_id or {})
+    metas = dict(instrument_metas or {})
     out: list[dict[str, Any]] = []
     for pos in positions:
         sym = symbol_for_id.get(pos.instrument_id, f"INST-{pos.instrument_id}")
@@ -108,6 +120,7 @@ def project_bot_owned_positions(
                 open_state=open_map.get(pos.position_id),
                 dynamic_band=band,
                 review=review_map.get(pos.position_id),
+                meta=metas.get(pos.instrument_id),
                 now_epoch=now_epoch,
             )
         )

@@ -37,6 +37,7 @@ from .etoro.trading import (
     fetch_portfolio,
 )
 from .execution.dynamic_stops import DynamicStopsStore
+from .execution.exchange_session import resolve_exchange_label_for
 from .execution.executor import ExecutionResult, TradeExecutor
 from .execution.monitor import PositionMonitor
 from .execution.stuck_orders import CancelResult, StuckOrder
@@ -214,9 +215,12 @@ class CycleRunner:
         summary = compute_account_summary(snapshot)
         self._record_performance_observe(bot_owned_positions, summary=summary)
         self._update_owned_instrument_ids(ctx, bot_owned_positions)
-        self._publish_portfolio(snapshot, bot_owned_position_ids=[
-            p.position_id for p in bot_owned_positions
-        ], symbol_for_id=ctx.universe.symbol_for_id)
+        self._publish_portfolio(
+            snapshot,
+            bot_owned_position_ids=[p.position_id for p in bot_owned_positions],
+            symbol_for_id=ctx.universe.symbol_for_id,
+            instrument_metas=ctx.instrument_metas,
+        )
         if self._abort_if_stopping("after portfolio fetch"):
             return
 
@@ -316,6 +320,7 @@ class CycleRunner:
             open_states=open_states,
             dynamic_stops=self._dynamic_stops,
             reviews_by_position_id=reviews_by_pos,
+            instrument_metas=ctx.instrument_metas,
         )
         by_symbol_proj = self._build_by_symbol_projection(candidates, bot_owned_positions, ctx)
         performance_block = build_performance_block(
@@ -341,6 +346,7 @@ class CycleRunner:
             enriched_owned_positions=enriched_owned,
             position_units_by_id=position_units,
             directives=directives.to_dict(),
+            instrument_metas=ctx.instrument_metas,
         )
         latency_str = f", {decision.latency_ms} ms" if decision.latency_ms is not None else ""
         self._log.info(
@@ -882,15 +888,19 @@ class CycleRunner:
         *,
         bot_owned_position_ids: list[int],
         symbol_for_id: dict[int, str],
+        instrument_metas: dict[int, InstrumentMeta] | None = None,
     ) -> None:
         if self._telemetry is None:
             return
+        metas = instrument_metas or {}
         positions_view = []
         for p in snapshot.positions:
+            sym = symbol_for_id.get(p.instrument_id, str(p.instrument_id))
             positions_view.append({
                 "position_id": p.position_id,
                 "instrument_id": p.instrument_id,
-                "symbol": symbol_for_id.get(p.instrument_id, str(p.instrument_id)),
+                "symbol": sym,
+                "exchange": resolve_exchange_label_for(metas.get(p.instrument_id), sym),
                 "is_buy": p.is_buy,
                 "open_rate": p.open_rate,
                 "amount": p.amount,

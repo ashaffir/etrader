@@ -17,7 +17,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from src.execution.exchange_session import (
+    currently_open_exchange_labels,
     exchange_label,
+    resolve_exchange_label_for,
     session_for,
     session_window_for,
 )
@@ -30,9 +32,19 @@ def _utc(y: int, m: int, d: int, hh: int = 0, mm: int = 0) -> datetime:
 
 @dataclass
 class _FakeMeta:
-    """Minimal stub matching :class:`InstrumentMeta` for these tests."""
+    """Minimal stub matching :class:`InstrumentMeta` for these tests.
+
+    The exchange resolver only needs ``price_source`` for the labelled
+    exchanges in the registry. The asset-class fallback path used by
+    :func:`resolve_exchange_label_for` also reads
+    ``stocks_industry_id`` / ``instrument_type_id`` / ``symbol_full``,
+    so we expose those with conservative defaults.
+    """
 
     price_source: str
+    stocks_industry_id: int | None = None
+    instrument_type_id: int | None = None
+    symbol_full: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +236,68 @@ class ExchangeLabelTests(unittest.TestCase):
 
     def test_fx_label(self) -> None:
         self.assertEqual(exchange_label(None, AssetClass.FX), "FX")
+
+
+class ResolveExchangeLabelForTests(unittest.TestCase):
+    """``resolve_exchange_label_for`` is the helper that LLM-payload
+    builders use to stamp positions and candidates. Confirm it returns
+    ``None`` (not "NYSE") when the meta is missing — that's the signal
+    "we don't know" and the LLM prompt is explicit about not guessing
+    in that case.
+    """
+
+    def test_lse_position_has_lse_label(self) -> None:
+        self.assertEqual(
+            resolve_exchange_label_for(_FakeMeta(price_source="lse"), "VOD.L"),
+            "LSE",
+        )
+
+    def test_missing_meta_returns_none(self) -> None:
+        self.assertIsNone(resolve_exchange_label_for(None, "AAPL"))
+
+    def test_crypto_symbol_returns_crypto(self) -> None:
+        # No price_source on the meta — ``asset_class_for`` falls back
+        # to the symbol-based crypto heuristic.
+        meta = _FakeMeta(price_source="")
+        self.assertEqual(resolve_exchange_label_for(meta, "BTC"), "CRYPTO")
+
+
+class CurrentlyOpenExchangeLabelsTests(unittest.TestCase):
+    """``currently_open_exchange_labels`` powers the universe-rotation
+    LLM call's ``currently_open_exchanges`` context field. The bot
+    biases foreign-ticker nominations off this list, so missing a
+    region here means the LLM goes back to recommending US names only.
+    """
+
+    def test_nyse_open_at_15_utc_summer(self) -> None:
+        # June 17, 2026 — EDT, NYSE open is 13:30 UTC.
+        labels = currently_open_exchange_labels(_utc(2026, 6, 17, 15))
+        self.assertIn("NYSE", labels)
+        self.assertIn("CRYPTO", labels)  # always 24/7
+
+    def test_lse_open_at_10_utc_summer(self) -> None:
+        labels = currently_open_exchange_labels(_utc(2026, 6, 17, 10))
+        self.assertIn("LSE", labels)
+
+    def test_tse_open_at_02_utc(self) -> None:
+        # Tokyo 11:00 JST = 02:00 UTC — well inside the 09:00–15:30 JST window.
+        labels = currently_open_exchange_labels(_utc(2026, 6, 17, 2))
+        self.assertIn("TSE", labels)
+        self.assertIn("HKEX", labels)
+
+    def test_weekend_has_only_crypto(self) -> None:
+        labels = currently_open_exchange_labels(_utc(2026, 6, 20, 12))  # Saturday
+        self.assertIn("CRYPTO", labels)
+        self.assertNotIn("NYSE", labels)
+        self.assertNotIn("LSE", labels)
+        self.assertNotIn("FX", labels)
+
+    def test_weekday_at_quiet_hour_is_not_completely_empty(self) -> None:
+        # 04:00 UTC weekday — Tokyo + HK + ASX still open, US/EU still closed.
+        labels = currently_open_exchange_labels(_utc(2026, 6, 17, 4))
+        self.assertIn("TSE", labels)
+        self.assertIn("CRYPTO", labels)
+        self.assertNotIn("NYSE", labels)
 
 
 if __name__ == "__main__":  # pragma: no cover

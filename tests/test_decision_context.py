@@ -47,6 +47,23 @@ class _OpenState:
         self.snapshots = 3
 
 
+class _FakeMeta:
+    """Lightweight stand-in for :class:`InstrumentMeta`.
+
+    The exchange resolver reads ``price_source`` first but also calls
+    ``asset_class_for``, which falls back to ``stocks_industry_id`` and
+    ``instrument_type_id`` when the price source is unknown. Defaulting
+    those to ``None`` matches the dataclass's optional-field shape so
+    the resolver can short-circuit cleanly on the price-source path.
+    """
+
+    def __init__(self, price_source: str) -> None:
+        self.price_source = price_source
+        self.stocks_industry_id: int | None = None
+        self.instrument_type_id: int | None = None
+        self.symbol_full: str | None = None
+
+
 class EnrichOwnedPositionTests(unittest.TestCase):
     def test_bare_position_emits_broker_fields_only(self) -> None:
         out = enrich_owned_position(
@@ -60,9 +77,38 @@ class EnrichOwnedPositionTests(unittest.TestCase):
         self.assertEqual(out["symbol"], "AAPL")
         self.assertEqual(out["positionId"], 1)
         self.assertEqual(out["pnl_usd"], 2.5)
+        # No meta → exchange is unknown. The LLM prompt is explicit
+        # about treating None as "I don't know" rather than guessing.
+        self.assertIsNone(out["exchange"])
         self.assertNotIn("mfe_usd", out)
         self.assertNotIn("stops", out)
         self.assertNotIn("review", out)
+
+    def test_meta_resolves_exchange_label(self) -> None:
+        out = enrich_owned_position(
+            position=_pos(),
+            symbol="VOD.L",
+            open_state=None,
+            dynamic_band=None,
+            review=None,
+            meta=_FakeMeta(price_source="lse"),
+        )
+        self.assertEqual(out["exchange"], "LSE")
+
+    def test_project_threads_meta_per_position(self) -> None:
+        positions = [_pos(pid=1, iid=10), _pos(pid=2, iid=11)]
+        symbol_for = {10: "VOD.L", 11: "AAPL"}
+        metas = {
+            10: _FakeMeta(price_source="lse"),
+            11: _FakeMeta(price_source="nasdaq"),
+        }
+        out = project_bot_owned_positions(
+            positions=positions,
+            symbol_for_id=symbol_for,
+            instrument_metas=metas,
+        )
+        labels = {row["symbol"]: row["exchange"] for row in out}
+        self.assertEqual(labels, {"VOD.L": "LSE", "AAPL": "NASDAQ"})
 
     def test_open_state_adds_perf_block(self) -> None:
         snap = _OpenState(pnl_usd=5.0, pnl_pct=5.0, mfe=8.0, mae=-1.0)

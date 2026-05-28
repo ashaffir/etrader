@@ -19,6 +19,13 @@ Hard rules:
   budget. You choose actions, USD amount for BUYs, fraction for partial CLOSE,
   and SL/TP/trailing percentages for MODIFY_STOPS. All percentages are positive
   numbers in (0, 50].
+- Each candidate and each open position carries an ``exchange`` field
+  (``"NYSE"``, ``"NASDAQ"``, ``"LSE"``, ``"XETRA"``, ``"HKEX"``, ``"TSE"``,
+  ``"ASX"``, ``"CRYPTO"``, ``"FX"``, …). The bot trades across all of them;
+  market-hours gating is per-exchange. When considering a BUY, factor in
+  whether that exchange has enough remaining session today to validate the
+  thesis — opening an LSE position 10 minutes before the London bell is rarely
+  a good idea even if the signal looks strong.
 - Prefer HOLD when signals are mixed or volatility is high. False positives are
   more expensive than missed opportunities.
 - NEVER emit BUY for an instrument that already has an open bot-owned LONG.

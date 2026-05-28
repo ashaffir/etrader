@@ -18,6 +18,7 @@ from ..ai.azure_client import AiCallResult, AzureFoundryClient, AzureUnavailable
 from ..ai.prompts import build_decision_prompt
 from ..config import AiConfig, GuardrailsConfig
 from ..etoro.trading import Position
+from ..execution.exchange_session import resolve_exchange_label_for
 from .autotune_parse import parse_tune_request
 from .autotune_types import TuneRequest
 from .decision_parser import parse_actions
@@ -73,6 +74,7 @@ class DecisionEngine:
         enriched_owned_positions: Sequence[Mapping[str, Any]] | None = None,
         position_units_by_id: Mapping[int, float] | None = None,
         directives: Mapping[str, Any] | None = None,
+        instrument_metas: Mapping[int, Any] | None = None,
     ) -> DecisionResult:
         tool_results = tool_results or {}
 
@@ -103,6 +105,7 @@ class DecisionEngine:
                     performance=performance,
                     enriched_owned_positions=enriched_owned_positions,
                     directives=directives,
+                    instrument_metas=instrument_metas,
                 )
                 requests = parse_actions(
                     ai_result.parsed_json,
@@ -163,6 +166,7 @@ class DecisionEngine:
         performance: Mapping[str, Any] | None = None,
         enriched_owned_positions: Sequence[Mapping[str, Any]] | None = None,
         directives: Mapping[str, Any] | None = None,
+        instrument_metas: Mapping[int, Any] | None = None,
     ) -> AiCallResult:
         assert self._ai_client is not None
         # Prefer the cycle's enriched view (MFE/MAE/time_held/stops/review)
@@ -183,11 +187,13 @@ class DecisionEngine:
                 }
                 for p in bot_owned_positions
             ]
+        metas = dict(instrument_metas or {})
         cands = [
             self._candidate_to_dict(
                 c,
                 tool_results.get(c.instrument_id),
                 fundamentals=fundamentals_by_symbol.get(c.symbol.upper()),
+                meta=metas.get(c.instrument_id),
             )
             for c in candidates
         ]
@@ -266,10 +272,12 @@ class DecisionEngine:
         tool_result: ToolRunResult | None,
         *,
         fundamentals: Mapping[str, Any] | None = None,
+        meta: Any | None = None,
     ) -> dict[str, Any]:
         out: dict[str, Any] = {
             "instrumentId": c.instrument_id,
             "symbol": c.symbol,
+            "exchange": resolve_exchange_label_for(meta, c.symbol),
             "action_hint": c.action,
             "strength": c.strength,
             "raw_score": c.raw_score,

@@ -4,6 +4,7 @@ We feed a synthetic ``Candidate`` list and inject a fake LLM client to
 verify the JSON contract the production prompt expects.
 """
 
+import json
 import unittest
 from typing import Any
 
@@ -19,12 +20,29 @@ class _FakeAi:
         self.parsed = parsed
         self.raise_unavailable = raise_unavailable
         self.calls = 0
+        self.last_user: str | None = None
 
     def chat_json(self, *, system: str, user: str, require_json: bool = True, call_type: str = "unknown") -> AiCallResult:  # noqa: ARG002
         self.calls += 1
+        self.last_user = user
         if self.raise_unavailable:
             raise AzureUnavailable("test-down")
         return AiCallResult(text="{}", parsed_json=self.parsed, latency_ms=42)
+
+
+class _FakeMeta:
+    """Minimal meta carrying the fields the exchange resolver reads.
+
+    Defaults the secondary fallback fields (``stocks_industry_id`` /
+    ``instrument_type_id``) to ``None`` so :func:`asset_class_for` can
+    short-circuit on the ``price_source`` path the test cares about.
+    """
+
+    def __init__(self, price_source: str) -> None:
+        self.price_source = price_source
+        self.stocks_industry_id: int | None = None
+        self.instrument_type_id: int | None = None
+        self.symbol_full: str | None = None
 
 
 def _candidate(action: str = "BUY", inst_id: int = 1, symbol: str = "AAPL", strength: float = 0.8) -> Candidate:
@@ -150,6 +168,51 @@ class DecisionEngineTests(unittest.TestCase):
         self.assertEqual(len(result.requests), 1)
         self.assertEqual(result.requests[0].action, "CLOSE")
         self.assertEqual(result.requests[0].position_id, 42)
+
+    def test_candidate_payload_includes_exchange_when_meta_supplied(self) -> None:
+        """``instrument_metas`` plumbing must reach the prompt payload.
+
+        This is the regression net for the multi-market funnel work:
+        if the engine ever stops threading meta into the candidate
+        dicts, the LLM goes blind to exchange context again and
+        regresses to US-centric reasoning.
+        """
+        ai = _FakeAi(parsed={"actions": [], "summary": "no-op"})
+        engine = DecisionEngine(
+            ai_cfg=self.ai_cfg, guardrails=self.guardrails, ai_client=ai,  # type: ignore[arg-type]
+        )
+        engine.decide(
+            candidates=[
+                _candidate(inst_id=1, symbol="AAPL"),
+                _candidate(inst_id=2, symbol="VOD.L"),
+            ],
+            portfolio_summary={"equity": 10_000.0},
+            bot_owned_positions=[],
+            symbol_for_id={1: "AAPL", 2: "VOD.L"},
+            instrument_metas={
+                1: _FakeMeta(price_source="nasdaq"),
+                2: _FakeMeta(price_source="lse"),
+            },
+        )
+        self.assertIsNotNone(ai.last_user)
+        payload = json.loads(ai.last_user)
+        by_symbol = {c["symbol"]: c for c in payload["candidates"]}
+        self.assertEqual(by_symbol["AAPL"]["exchange"], "NASDAQ")
+        self.assertEqual(by_symbol["VOD.L"]["exchange"], "LSE")
+
+    def test_candidate_payload_exchange_none_when_meta_missing(self) -> None:
+        ai = _FakeAi(parsed={"actions": [], "summary": "no-op"})
+        engine = DecisionEngine(
+            ai_cfg=self.ai_cfg, guardrails=self.guardrails, ai_client=ai,  # type: ignore[arg-type]
+        )
+        engine.decide(
+            candidates=[_candidate()],
+            portfolio_summary={"equity": 10_000.0},
+            bot_owned_positions=[],
+            symbol_for_id={1: "AAPL"},
+        )
+        payload = json.loads(ai.last_user or "{}")
+        self.assertIsNone(payload["candidates"][0]["exchange"])
 
 
 class TuningRoundTripTests(unittest.TestCase):

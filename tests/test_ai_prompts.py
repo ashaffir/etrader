@@ -15,7 +15,11 @@ from __future__ import annotations
 import json
 import unittest
 
-from src.ai.prompts import build_decision_prompt, build_qa_prompt
+from src.ai.prompts import (
+    build_decision_prompt,
+    build_qa_prompt,
+    build_universe_rotation_prompt,
+)
 
 
 class QaPromptModeAgnosticTests(unittest.TestCase):
@@ -172,6 +176,66 @@ class DecisionPromptDynamicManagementTests(unittest.TestCase):
         )
         payload = json.loads(user)
         self.assertIsNone(payload["performance"])
+
+
+class DecisionPromptExchangeContextTests(unittest.TestCase):
+    """The decision system prompt must signpost the per-instrument
+    ``exchange`` field so the LLM stops assuming everything is on US
+    hours. Without these mentions the multi-market work is invisible
+    to the model.
+    """
+
+    def test_system_prompt_mentions_exchange_field(self) -> None:
+        system, _ = build_decision_prompt(
+            portfolio_summary={}, bot_owned_positions=[], candidates=[],
+            guardrails_summary={},
+        )
+        # The DECISION_SYSTEM block now lists exchange labels — both
+        # the field's existence and an example of US + foreign labels.
+        for label in ("exchange", "NYSE", "LSE", "TSE", "CRYPTO"):
+            self.assertIn(label, system)
+
+
+class UniverseRotationRegionAwareTests(unittest.TestCase):
+    """The rotation prompt powers LLM ticker nominations for the
+    universe. Two regressions are covered:
+
+    1. The system prompt must allow exchange-suffixed tickers (e.g.
+       ``VOD.L``) — the previous version forbade them, capping the
+       LLM to US tickers only.
+    2. The user payload must include ``currently_open_exchanges`` so
+       the LLM can bias nominations toward markets the bot can act
+       on right now.
+    """
+
+    def test_system_allows_suffixed_tickers(self) -> None:
+        system, _ = build_universe_rotation_prompt(
+            base_symbols=("AAPL",), excluded_symbols=(), max_count=5,
+        )
+        # The exact wording of the rule changed; lock the key
+        # tokens rather than the prose.
+        self.assertIn("exchange suffix", system.lower())
+        for example in ("VOD.L", "ASML.AS", "7203.T", "0700.HK"):
+            self.assertIn(example, system)
+
+    def test_user_payload_includes_currently_open_exchanges(self) -> None:
+        _, user = build_universe_rotation_prompt(
+            base_symbols=("AAPL",),
+            excluded_symbols=(),
+            max_count=3,
+            currently_open_exchanges=("NYSE", "LSE", "CRYPTO"),
+        )
+        payload = json.loads(user)
+        self.assertEqual(
+            payload["currently_open_exchanges"], ["NYSE", "LSE", "CRYPTO"],
+        )
+
+    def test_user_payload_defaults_currently_open_to_empty_list(self) -> None:
+        _, user = build_universe_rotation_prompt(
+            base_symbols=(), excluded_symbols=(), max_count=1,
+        )
+        payload = json.loads(user)
+        self.assertEqual(payload["currently_open_exchanges"], [])
 
 
 if __name__ == "__main__":

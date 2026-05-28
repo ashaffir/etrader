@@ -18,7 +18,12 @@ from .aggregator import NewsAggregator
 from .candidate_store import CandidateStore
 from .scheduler import NewsScheduler
 from .sources.base import NewsSource
-from .sources.google_news_rss import DEFAULT_QUERIES, GoogleNewsRssSource
+from .sources.google_news_rss import (
+    DEFAULT_QUERIES,
+    REGIONAL_LOCALES,
+    REGIONAL_QUERIES,
+    GoogleNewsRssSource,
+)
 from .sources.sec_edgar import SecEdgar8KSource
 from .sources.stocktwits import StockTwitsTrendingSource
 from .sources.yahoo_rss import YahooRssSource
@@ -57,6 +62,22 @@ def build_news_sources(
                     logger=child_logger,
                 )
             )
+        elif canonical == "google_news_regional":
+            # Fan out one source per regional locale. Each contributes
+            # its own batch of headlines so the aggregator handles
+            # them like any other source (with the standard scoring,
+            # dedupe, and TTL).
+            for locale in REGIONAL_LOCALES:
+                out.append(
+                    GoogleNewsRssSource(
+                        queries=REGIONAL_QUERIES,
+                        locale=locale,
+                        max_items_per_query=cfg.google_news_max_items_per_query,
+                        logger=logging.getLogger(
+                            f"{base_name}.google_news.{locale.label.lower()}"
+                        ),
+                    )
+                )
         elif canonical == "yahoo_rss":
             out.append(
                 YahooRssSource(

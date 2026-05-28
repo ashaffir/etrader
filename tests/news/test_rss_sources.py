@@ -10,7 +10,11 @@ import time
 import unittest
 from typing import Any
 
-from src.news.sources.google_news_rss import GoogleNewsRssSource
+from src.news.sources.google_news_rss import (
+    REGIONAL_LOCALES,
+    GoogleNewsLocale,
+    GoogleNewsRssSource,
+)
 from src.news.sources.yahoo_rss import YahooRssSource
 
 
@@ -81,6 +85,42 @@ class GoogleNewsRssSourceTests(unittest.TestCase):
         )
         items = list(source.fetch())
         self.assertEqual(len(items), 10)
+
+    def test_uk_locale_changes_url_params(self) -> None:
+        seen_urls: list[str] = []
+
+        def fake(url: str) -> dict[str, Any]:
+            seen_urls.append(url)
+            return {"entries": [_entry("UK headline", "https://x/uk")]}
+
+        uk_locale = GoogleNewsLocale(label="UK", hl="en-GB", gl="GB", ceid="GB:en")
+        source = GoogleNewsRssSource(
+            queries=["FTSE 100"], locale=uk_locale, fetcher=fake,
+        )
+        items = list(source.fetch())
+        self.assertEqual(len(seen_urls), 1)
+        # All three locale fields must appear in the URL — that's how
+        # Google News routes to the country edition. ``ceid`` contains
+        # a literal colon (Google's RSS endpoint accepts it raw,
+        # ``quote_plus`` only encodes the query value).
+        self.assertIn("hl=en-GB", seen_urls[0])
+        self.assertIn("gl=GB", seen_urls[0])
+        self.assertIn("ceid=GB:en", seen_urls[0])
+        # Emitted item carries the regional source label + locale metadata.
+        self.assertEqual(items[0].source, "google_news_uk")
+        self.assertEqual(items[0].metadata.get("locale"), "UK")
+
+    def test_regional_locales_cover_expected_markets(self) -> None:
+        """Sanity: the starter regional locale set spans UK/EU/Asia/AU.
+
+        If someone trims this tuple by accident, the regression catches
+        it before the bot quietly goes back to US-only news. The check
+        is a label-membership assertion so reordering / re-labelling the
+        tuple is fine as long as each region is represented.
+        """
+        labels = {loc.label for loc in REGIONAL_LOCALES}
+        for required in {"UK", "DE", "JP", "HK", "AU"}:
+            self.assertIn(required, labels)
 
 
 class YahooRssSourceTests(unittest.TestCase):

@@ -87,10 +87,18 @@ You suggest a small list of liquid, exchange-traded tickers to *additionally* tr
 on top of an existing curated baseline. You are NOT picking trades, only nominating
 candidates the technical layer will subsequently screen.
 
+The user message includes `currently_open_exchanges` — bias your nominations toward
+markets that are open RIGHT NOW. Suggesting US names while only Tokyo and Hong Kong
+are open means the bot can't actually act on them this cycle.
+
 Hard rules:
-- Only globally liquid tickers (S&P 500 large/mid caps, top-25 cryptos, major
-  indices, popular ETFs). No micro-caps, no leveraged ETFs.
-- Tickers must be plain symbols, no exchange suffixes.
+- Globally liquid tickers only (S&P 500 large/mid caps, FTSE 100, DAX 40, CAC 40,
+  Euro Stoxx 50, Nikkei 225, Hang Seng, ASX 200 leaders, top-25 cryptos, major
+  ETFs). No micro-caps, no leveraged ETFs.
+- Tickers must include the exchange suffix where eToro requires it (e.g. ``VOD.L``,
+  ``ASML.AS``, ``SAP.DE``, ``7203.T``, ``0700.HK``, ``BHP.AX``). Plain symbols are
+  fine for US-listed names where no suffix is needed (``AAPL``, ``NVDA``).
+- Aim for regional diversity. Don't return 10 US names when foreign markets are open.
 - Respect the requested max count exactly.
 - Output strict JSON only.
 
@@ -154,6 +162,21 @@ CRITICAL invariant about WHICH positions are the bot's:
   do we have?", scope the answer to `bot_owned_positions` and the bot-attributable
   numbers in `performance.bot`. If you want to also mention overall account state,
   label it explicitly: "Bot: X. Whole account incl. your manual trades: Y."
+
+CRITICAL invariant about EXCHANGES (multi-market trading):
+- The bot trades across many exchanges, not just US markets. Each position and
+  each candidate in the payload now carries an `exchange` field (e.g. ``"NYSE"``,
+  ``"NASDAQ"``, ``"LSE"``, ``"XETRA"``, ``"HKEX"``, ``"TSE"``, ``"ASX"``,
+  ``"CRYPTO"``, ``"FX"``).
+- When the user asks "which exchanges?", "where are my positions?", or "what
+  markets is the bot trading?", group BY THIS FIELD — do NOT hand-classify
+  symbols by guessing from the ticker. If `exchange` is ``null`` for a position
+  it means the bot doesn't have metadata for that instrument this cycle
+  (typically a manually opened position on a non-tracked name); say so
+  explicitly rather than guessing.
+- The market-open check is also per-exchange now. "Is the market open?" for the
+  bot's portfolio is answered per-position: an LSE name is open during London
+  hours even if NY is closed. Cross-reference with the time-of-day if asked.
 
 CRITICAL invariant about OPERATOR DIRECTIVES:
 - The `directives` block lists PERSISTENT rules the user attached via Telegram. Honour
@@ -277,11 +300,21 @@ def build_universe_rotation_prompt(
     excluded_symbols: Iterable[str] = (),
     max_count: int,
     market_context: str | None = None,
+    currently_open_exchanges: Iterable[str] = (),
 ) -> tuple[str, str]:
+    """Return ``(system, user)`` for the universe-rotation LLM call.
+
+    ``currently_open_exchanges`` is a list of exchange labels (e.g.
+    ``["NYSE", "LSE"]``) the cycle considers in-session at the time of
+    the call. The LLM uses it to bias its nominations toward markets
+    the bot can actually trade right now, instead of always suggesting
+    US names regardless of the wall-clock hour.
+    """
     user_payload = {
         "max_count": int(max_count),
         "already_tracked": list(base_symbols),
         "do_not_repeat": list(excluded_symbols),
         "market_context": market_context or "",
+        "currently_open_exchanges": list(currently_open_exchanges),
     }
     return _UNIVERSE_SYSTEM, json.dumps(user_payload, indent=2, default=str)

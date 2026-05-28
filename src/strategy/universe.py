@@ -42,8 +42,19 @@ from ..etoro.market_data import (
     fetch_rates,
     search_instrument,
 )
+from ..execution.exchange_session import currently_open_exchange_labels
 from ..news.candidate_store import Candidate, CandidateStore
 from .activity_filter import ActivityDecision, ActivityFilter
+
+
+def _currently_open_exchanges() -> list[str]:
+    """Wrapper so tests can monkeypatch this without touching the
+    module-level import of :func:`currently_open_exchange_labels`.
+    """
+    try:
+        return list(currently_open_exchange_labels())
+    except Exception:  # noqa: BLE001 — never let this break a cycle
+        return []
 
 
 # Source-tag priorities — when survival is competitive, prefer this
@@ -451,6 +462,7 @@ class UniverseBuilder:
             excluded_symbols=tuple(excluded_upper),
             max_count=max_count,
             market_context=context,
+            currently_open_exchanges=_currently_open_exchanges(),
         )
         try:
             result = self._ai.chat_json(
