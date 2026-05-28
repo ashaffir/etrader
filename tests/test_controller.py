@@ -135,6 +135,25 @@ class PauseResumeTests(unittest.TestCase):
         assert meta is not None
         self.assertTrue(meta.paused)
 
+    def test_unhalt_clears_sticky_kill_switch(self) -> None:
+        """``/unhalt`` is the operator's escape hatch when a previous
+        drawdown set ``halted_today=true`` and the bot has done actions
+        today (so the kill switch won't auto-clear). The method must
+        flip the flag, wipe the baseline so the next cycle rebases, and
+        report ``was_halted=true`` exactly once.
+        """
+        state = self.controller._state  # noqa: SLF001 — test scaffolding
+        state.halted_today = True
+        state.session_baseline_equity = 12_345.0
+        result = self.controller.unhalt(reason="test")
+        self.assertTrue(result["was_halted"])
+        self.assertFalse(state.halted_today)
+        self.assertIsNone(state.session_baseline_equity)
+
+        # Second call is a no-op — there is nothing to clear.
+        result2 = self.controller.unhalt()
+        self.assertFalse(result2["was_halted"])
+
 
 class GuardrailEditTests(unittest.TestCase):
     def setUp(self) -> None:

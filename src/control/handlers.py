@@ -92,6 +92,11 @@ def _resume(c: BotController, _body, _q) -> tuple[int, Any]:
     return 200, c.resume()
 
 
+def _unhalt(c: BotController, body: Mapping[str, Any] | None, _q) -> tuple[int, Any]:
+    reason = (body or {}).get("reason")
+    return 200, c.unhalt(reason=reason)
+
+
 def _panic(c: BotController, body: Mapping[str, Any] | None, _q) -> tuple[int, Any]:
     body = body or {}
     scope = str(body.get("scope") or "all").lower()
@@ -316,6 +321,7 @@ def build_route_table() -> RouteTable:
     rt.add("POST", "/config/guardrails", _config_set)
     rt.add("POST", "/pause", _pause)
     rt.add("POST", "/resume", _resume)
+    rt.add("POST", "/unhalt", _unhalt)
     rt.add("POST", "/panic", _panic)
     rt.add("POST", "/ask", _ask)
     rt.add("POST", "/shutdown", _shutdown)

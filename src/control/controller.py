@@ -252,6 +252,41 @@ class BotController:
             )
         return {"paused": False, "was_already_running": already}
 
+    def unhalt(self, *, reason: str | None = None) -> dict[str, Any]:
+        """Force-clear the daily-loss kill switch immediately.
+
+        Use case: the operator changed ``daily_loss_stop_usd`` or
+        explicitly wants the bot to resume mid-day without waiting for
+        the UTC rollover. We clear ``halted_today`` and rebase the
+        equity baseline against the current portfolio so any
+        subsequent drawdown check starts from the resume point — NOT
+        from the morning baseline that already counted today's losses.
+
+        Returns the previous halt state so callers can format an
+        appropriate "was already running" / "halt cleared" message.
+        """
+        with self._lock:
+            was_halted = bool(self._state.halted_today)
+            self._state.halted_today = False
+            # Force the next kill-switch tick to rebase against live
+            # equity — wiping ``session_baseline_equity`` triggers the
+            # ``current_equity is not None`` branch in the kill switch.
+            self._state.session_baseline_equity = None
+            self.persist_state()
+        self._log.info(
+            "[control] unhalt requested%s", f" — {reason}" if reason else "",
+        )
+        if was_halted:
+            self._emit_alert(
+                AlertType.BOT_PAUSED_RESUMED,
+                title="BOT UNHALTED",
+                body=(
+                    "Daily-loss kill switch cleared manually. "
+                    "Equity baseline will rebase on the next cycle."
+                ),
+            )
+        return {"was_halted": was_halted, "reason": reason}
+
     def set_paused_initial(self, paused: bool) -> None:
         """Restore paused flag at startup from persisted state."""
         with self._lock:

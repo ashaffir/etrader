@@ -358,6 +358,7 @@ def format_help() -> str:
         "  /start             resume the trading loop\n"
         "  /stop              same as /pause\n"
         "  /resume            same as /start\n"
+        "  /unhalt            clear daily-loss kill switch (resume new BUYs)\n"
         "  /panic             close ALL open positions (incl. manual) and pause\n"
         "  /panic_bot_only    close only bot-owned positions and pause\n"
         "  /ask <question>    ask the LLM about the bot's state\n"

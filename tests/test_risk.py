@@ -423,6 +423,53 @@ class DailyLossKillSwitchTests(unittest.TestCase):
         self.assertEqual(state.bot_actions_today, 0)
         self.assertEqual(state.session_baseline_equity, 10_000.0)
 
+    def test_zero_cap_disables_kill_switch_even_on_big_drawdown(self) -> None:
+        """``daily_loss_stop_usd <= 0`` is the "always-on" sentinel.
+
+        The bot must never halt on drawdown in that mode — even when
+        the bot DID take actions today and lost a meaningful amount.
+        """
+        import datetime as dt
+        state = BotState()
+        today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+        state.halted_day = today
+        state.baseline_day = today
+        state.session_baseline_equity = 10_000.0
+        state.bot_actions_today = 4  # bot has skin in the game
+        ev = _eval(daily_loss_stop_usd=0.0)
+        verdicts = ev.evaluate(
+            requests=[TradeRequest(1, "AAPL", "BUY", 100.0)],
+            state=state,
+            current_equity=8_000.0,  # 20% drawdown
+            bot_owned_position_count=1,
+        )
+        self.assertFalse(state.halted_today)
+        self.assertNotIn("kill switch", verdicts[0].reason)
+
+    def test_zero_cap_clears_pre_existing_halt(self) -> None:
+        """Switching the cap to 0 mid-day must clear a sticky halt.
+
+        Operator-facing contract: ``/set daily_loss_stop_usd 0`` and the
+        bot resumes on the next cycle without an explicit /unhalt.
+        """
+        import datetime as dt
+        state = BotState()
+        today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+        state.halted_today = True
+        state.halted_day = today
+        state.baseline_day = today
+        state.session_baseline_equity = 10_000.0
+        state.bot_actions_today = 3
+        ev = _eval(daily_loss_stop_usd=0.0)
+        verdicts = ev.evaluate(
+            requests=[TradeRequest(1, "AAPL", "BUY", 100.0)],
+            state=state,
+            current_equity=9_500.0,
+            bot_owned_position_count=0,
+        )
+        self.assertFalse(state.halted_today)
+        self.assertNotIn("kill switch", verdicts[0].reason)
+
 
 class StopLossTakeProfitTests(unittest.TestCase):
     def test_long_sl_below_tp_above(self) -> None:

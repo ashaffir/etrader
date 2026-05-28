@@ -31,7 +31,7 @@ max_parallel_trades        = 10      # max simultaneous open positions opened by
 # is below `min_amend_remainder_usd`, the BUY is rejected entirely.
 max_bot_invested_usd       = 2000.0
 min_amend_remainder_usd    = 50.0    # floor under which budget-amended BUYs are rejected, not shrunk further
-daily_loss_stop_usd        = 250.0   # halt new opens for the day if equity drops by ≥ this vs. session start
+daily_loss_stop_usd        = 0.0     # 0 = disabled (always-on mode); set >0 to halt new opens if today's drawdown ≥ this vs. session start
 per_instrument_cooldown_min = 60     # after closing/opening on an instrument, ignore it for N minutes
 default_stop_loss_pct      = 5.0     # SL distance from entry (% of entry price)
 default_take_profit_pct    = 8.0     # TP distance from entry (% of entry price)

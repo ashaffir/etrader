@@ -100,6 +100,9 @@ class ControlAPIClient:
     def resume(self) -> dict[str, Any]:
         return self._request("POST", "/resume")
 
+    def unhalt(self, *, reason: str | None = None) -> dict[str, Any]:
+        return self._request("POST", "/unhalt", body={"reason": reason})
+
     def panic(self, *, scope: str = "all", reason: str | None = None) -> dict[str, Any]:
         return self._request("POST", "/panic", body={"scope": scope, "reason": reason})
 

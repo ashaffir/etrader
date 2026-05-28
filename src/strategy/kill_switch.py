@@ -1,7 +1,13 @@
 """Daily-loss kill switch — bot-attributable drawdown only.
 
-Two important properties:
+Three important properties:
 
+- ``daily_loss_stop_usd <= 0`` **disables** the kill switch entirely.
+  In that mode the function never sets ``halted_today`` and actively
+  *clears* any previously-set halt (e.g. from a config change mid-day
+  or an operator switching the cap off). This is the "always-on,
+  always-checking" mode the operator can opt into when they'd rather
+  let signal quality + per-trade stops manage risk.
 - The kill switch only ever fires when the bot has skin in the game
   today (an open bot-owned position OR a successful BUY/CLOSE this
   session-day). Drawdown caused by the user's manual or mirror
@@ -38,6 +44,7 @@ def update_and_check_kill_switch(
     """
     today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
     bot_has_skin = (bot_owned_position_count > 0) or (state.bot_actions_today > 0)
+    kill_switch_disabled = cfg.daily_loss_stop_usd <= 0.0
 
     if state.halted_day != today:
         # New UTC day: reset the daily counters and rebase the baseline.
@@ -50,6 +57,14 @@ def update_and_check_kill_switch(
         # Rare: persisted baseline carried in from yesterday. Rebase.
         state.session_baseline_equity = current_equity
         state.baseline_day = today
+
+    if kill_switch_disabled:
+        # Operator opted into "always-on" mode. Clear any sticky halt
+        # left over from a previous config and skip the drawdown check.
+        # The baseline is kept so re-enabling mid-day measures drawdown
+        # from a real reference point rather than mid-flight equity.
+        state.halted_today = False
+        return False
 
     if state.halted_today and not bot_has_skin:
         # Stale halt — there's nothing the bot could have damaged today,

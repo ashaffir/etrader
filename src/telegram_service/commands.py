@@ -226,6 +226,17 @@ def _h_resume(ctx: CommandContext) -> str:
     return "Bot resumed. Next cycle will run in <= check_interval_seconds."
 
 
+def _h_unhalt(ctx: CommandContext) -> str:
+    result = ctx.api.unhalt(reason=f"telegram:{ctx.sender_username or '?'}")
+    if not result.get("was_halted"):
+        return "Bot was not halted — nothing to clear."
+    return (
+        "Daily-loss kill switch cleared. Equity baseline will rebase on the "
+        "next cycle. Set `daily_loss_stop_usd` to 0 via /set if you want to "
+        "disable the kill switch permanently."
+    )
+
+
 def _h_panic(ctx: CommandContext) -> str:
     result = ctx.api.panic(scope="all", reason=f"telegram:{ctx.sender_username or '?'}")
     return format_panic_result(result)
@@ -425,6 +436,7 @@ _COMMANDS: dict[str, CommandHandler] = {
     "stop": _h_pause,         # alias — user-facing /stop pauses the loop
     "resume": _h_resume,
     "start": _h_resume,       # alias — /start resumes
+    "unhalt": _h_unhalt,
     "panic": _h_panic,
     "panic_bot_only": _h_panic_bot_only,
     "panicbotonly": _h_panic_bot_only,  # tolerant
