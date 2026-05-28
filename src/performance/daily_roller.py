@@ -5,11 +5,11 @@ A ``DailyRoller`` owns the in-memory :class:`DailySnapshot` for *today*
 and knows how to:
 
 - start a new row on the first call of a new UTC day,
-- flush the previous day's row to the JSONL ledger on rollover,
+- finalize the previous day's row in storage on rollover,
 - update the high/low/close fields each cycle,
 - bump the per-day counters when trades open or close,
-- rewrite the most-recent line in the ledger so an in-progress day
-  is always reflected on disk.
+- upsert the running day's row so the on-disk snapshot is always
+  in sync with what the bot is observing right now.
 
 All methods assume the caller holds the tracker's lock.
 """
@@ -17,9 +17,7 @@ All methods assume the caller holds the tracker's lock.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Iterable
+from datetime import datetime
 
 from .storage import PerformanceStorage
 from .types import DailySnapshot, RealizedTrade
@@ -82,14 +80,15 @@ class DailyRoller:
         self._dirty = True
 
     def flush_if_dirty(self) -> None:
-        """Persist today's running snapshot to JSONL."""
+        """Upsert today's running snapshot in the database.
+
+        With the SQLite backend this is a single atomic upsert keyed
+        on ``date_iso``, so we don't need the old "rewrite the
+        ledger minus the last row" dance.
+        """
         if self._today is None or not self._dirty:
             return
-        existing = self._storage.read_dailies()
-        if existing and existing[-1].date_iso == self._today.date_iso:
-            self._rewrite(existing[:-1] + [self._today])
-        else:
-            self._storage.append_daily(self._today)
+        self._storage.upsert_daily(self._today)
         self._dirty = False
 
     def today(self) -> DailySnapshot | None:
@@ -108,18 +107,10 @@ class DailyRoller:
         today_iso = now.strftime("%Y-%m-%d")
         if self._today is not None and self._today.date_iso == today_iso:
             return self._today
+        # Day boundary: flush the outgoing row before starting a new one
+        # so the previous day's final snapshot is never lost.
         if self._today is not None and self._dirty:
-            self._storage.append_daily(self._today)
+            self._storage.upsert_daily(self._today)
         self._today = DailySnapshot(date_iso=today_iso)
         self._dirty = False
         return self._today
-
-    def _rewrite(self, rows: Iterable[DailySnapshot]) -> None:
-        path = self._storage._daily_path  # noqa: SLF001
-        try:
-            import json
-            with path.open("w", encoding="utf-8") as fh:
-                for r in rows:
-                    fh.write(json.dumps(r.to_dict(), default=str) + "\n")
-        except OSError as exc:
-            self._logger.warning("perf daily rewrite failed: %s", exc)

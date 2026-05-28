@@ -19,18 +19,23 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Callable, Iterable
 
-from ..execution.session import session_state
+from ..execution.exchange_session import (
+    exchange_label,
+    session_for,
+    session_window_for,
+)
 from ..performance.types import OpenTradeState
 from .directives import Directives
 from .risk import TradeRequest
 from .tools.base import AssetClass, asset_class_for
 
 
-# Default cushion before equity close at 21:00 UTC. When `no_overnight`
-# is on and the bot is within this window of close, every non-crypto
-# bot-owned position gets a CLOSE injected. Chosen to be wider than
-# typical eToro market-order latency (a few seconds) but narrow enough
-# to leave most of the trading day uninterrupted.
+# Pre-bell cushion. When ``no_overnight`` is on AND the session is
+# currently open, we start emitting CLOSE requests this many seconds
+# before the bell rings so the orders land while there's still
+# liquidity on the book. Once the session is *closed* the close-out
+# fires every cycle regardless of this constant — see
+# :func:`_should_flatten_equities` for the full rule.
 DEFAULT_FLATTEN_WINDOW_SECONDS = 5 * 60
 
 
@@ -113,9 +118,11 @@ def build_directive_close_requests(
 
     * ``hold_ceiling_minutes`` (when > 0): close any bot position
       whose elapsed hold time exceeds the ceiling.
-    * ``no_overnight``: close any non-crypto bot position if the
-      US equity session is currently within
-      ``flatten_window_seconds`` of close.
+    * ``no_overnight``: close any non-crypto bot position whenever
+      the US equity session is currently closed (weekend, holiday,
+      pre-market, after-hours) OR is open but within
+      ``flatten_window_seconds`` of close. See
+      :func:`_should_flatten_equities` for details.
 
     A position can match both rules — we deduplicate so the cycle
     only emits one CLOSE per position.
@@ -127,10 +134,6 @@ def build_directive_close_requests(
     notes: list[dict[str, Any]] = []
     seen: set[int] = set()
 
-    in_flatten_window = (
-        directives.no_overnight
-        and _is_equity_flatten_window(now=now, window_seconds=flatten_window_seconds)
-    )
     hold_ceiling_seconds = (
         int(directives.hold_ceiling_minutes) * 60
         if directives.hold_ceiling_minutes > 0 else 0
@@ -160,10 +163,16 @@ def build_directive_close_requests(
                 f"held {held_seconds // 60} min ≥ "
                 f"{directives.hold_ceiling_minutes} min ceiling"
             )
-        elif in_flatten_window and asset_class != AssetClass.CRYPTO:
+        elif directives.no_overnight and _position_needs_flatten(
+            meta=meta,
+            asset_class=asset_class,
+            now=now,
+            window_seconds=flatten_window_seconds,
+        ):
             directive = "no_overnight"
-            reason = (
-                "equity flatten window — close before US session ends"
+            reason = _flatten_reason(
+                meta=meta, asset_class=asset_class, now=now,
+                window_seconds=flatten_window_seconds,
             )
 
         if reason is None or directive is None:
@@ -215,27 +224,67 @@ def _held_seconds(
     return int(elapsed)
 
 
-# US equity regular session close in UTC — must stay in sync with
-# :mod:`src.execution.session`. Centralising would be a future refactor.
-_EQUITY_CLOSE_HOUR_UTC = 21
-_EQUITY_CLOSE_MINUTE_UTC = 0
+def _position_needs_flatten(
+    *,
+    meta: Any | None,
+    asset_class: AssetClass,
+    now: datetime,
+    window_seconds: int,
+) -> bool:
+    """Per-instrument flatten check.
 
+    ``no_overnight=true`` means "the bot must not hold this position
+    outside its home exchange's regular session". Triggers when:
 
-def _is_equity_flatten_window(*, now: datetime, window_seconds: int) -> bool:
-    """True when the US equity session is currently open but within
-    ``window_seconds`` of close. False on weekends / outside-session.
+    1. The instrument's home session is currently CLOSED (weekend,
+       holiday, pre-market, after-hours). The bot keeps emitting
+       CLOSE requests every cycle until the broker lets us exit;
+       per-instrument cooldown prevents spam on a single name.
+    2. The session is open but within ``window_seconds`` of close —
+       so the order lands while liquidity is still on the book.
+
+    Crypto is never flattened (24/7). FX flattens only on weekends
+    (its own "session closed").
+
+    Unlike the previous implementation this is keyed off the
+    instrument's actual exchange (LSE / XETRA / HKEX / …) — not the
+    US session — so a London position doesn't get force-closed at
+    NY 16:00 while LSE is in mid-session.
     """
-    state = session_state(AssetClass.STOCK, now)
-    if not state.is_open:
+    if asset_class == AssetClass.CRYPTO:
         return False
-    close = now.replace(
-        hour=_EQUITY_CLOSE_HOUR_UTC,
-        minute=_EQUITY_CLOSE_MINUTE_UTC,
-        second=0,
-        microsecond=0,
-    )
-    delta = (close - now).total_seconds()
+    state = session_for(meta, asset_class, now)
+    if not state.is_open:
+        return True
+    window = session_window_for(meta, asset_class, now)
+    if window is None:
+        # FX has no fixed daily window — only the weekend close fires.
+        return False
+    _open_utc, close_utc = window
+    delta = (close_utc - now).total_seconds()
     return 0 <= delta <= window_seconds
+
+
+def _flatten_reason(
+    *,
+    meta: Any | None,
+    asset_class: AssetClass,
+    now: datetime,
+    window_seconds: int,
+) -> str:
+    """Human-readable reason for the CLOSE — surfaced in alerts + logs."""
+    label = exchange_label(meta, asset_class)
+    state = session_for(meta, asset_class, now)
+    if not state.is_open:
+        return f"no_overnight: {label} closed — flattening position"
+    window = session_window_for(meta, asset_class, now)
+    if window is None:
+        return f"no_overnight: {label} closing soon"
+    _open_utc, close_utc = window
+    delta = int((close_utc - now).total_seconds())
+    return (
+        f"no_overnight: {delta}s to {label} close — pre-emptive flatten"
+    )
 
 
 __all__ = [

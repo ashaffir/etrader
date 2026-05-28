@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime, timezone
 
 from src.execution.session import (
+    equity_session_window,
     is_market_open,
     seconds_since_open,
     session_state,
@@ -57,42 +58,90 @@ class FxSessionTests(unittest.TestCase):
 
 
 class EquitySessionTests(unittest.TestCase):
-    """US-equity session: weekdays UTC 13:30-21:00."""
+    """US-equity session: 09:30–16:00 New York local time, DST-aware."""
 
-    def test_open_inside_session(self) -> None:
+    # ---- EDT (summer) — 13:30–20:00 UTC -----------------------------
+
+    def test_edt_open_inside_session(self) -> None:
+        # 2026-05-26 is a Tuesday in EDT (NY summer time).
         self.assertTrue(
             is_market_open(AssetClass.STOCK, _utc(2026, 5, 26, 15, 0)),
         )
+        # 19:59 UTC = 15:59 EDT, last minute of session.
         self.assertTrue(
-            is_market_open(AssetClass.STOCK, _utc(2026, 5, 26, 20, 59)),
+            is_market_open(AssetClass.STOCK, _utc(2026, 5, 26, 19, 59)),
         )
 
-    def test_pre_open_closed(self) -> None:
-        # 8 AM UTC is well before the 13:30 UTC open.
+    def test_edt_pre_open_closed(self) -> None:
+        # 8 AM UTC = 4 AM EDT, well before 09:30 EDT (13:30 UTC) open.
         self.assertFalse(
             is_market_open(AssetClass.STOCK, _utc(2026, 5, 26, 8, 0)),
         )
 
-    def test_post_close_closed(self) -> None:
-        # 21:00 UTC is the close — boundary is inclusive of close
-        # (treated as already closed).
+    def test_edt_post_close_closed(self) -> None:
+        # 20:00 UTC = 16:00 EDT — exact close, treated as already closed.
         self.assertFalse(
-            is_market_open(AssetClass.STOCK, _utc(2026, 5, 26, 21, 0)),
+            is_market_open(AssetClass.STOCK, _utc(2026, 5, 26, 20, 0)),
+        )
+        # 20:30 UTC is 30 min after the EDT bell. THE bug the user hit:
+        # before the DST fix, this returned True because the hard-coded
+        # window said 21:00 UTC close.
+        self.assertFalse(
+            is_market_open(AssetClass.STOCK, _utc(2026, 5, 26, 20, 30)),
         )
 
+    # ---- EST (winter) — 14:30–21:00 UTC -----------------------------
+
+    def test_est_open_inside_session(self) -> None:
+        # 2026-01-13 is a Tuesday in EST (NY winter time).
+        # 15:00 UTC = 10:00 EST → mid-session.
+        self.assertTrue(
+            is_market_open(AssetClass.STOCK, _utc(2026, 1, 13, 15, 0)),
+        )
+        # 20:59 UTC = 15:59 EST, last minute of session.
+        self.assertTrue(
+            is_market_open(AssetClass.STOCK, _utc(2026, 1, 13, 20, 59)),
+        )
+
+    def test_est_pre_open_closed(self) -> None:
+        # 14:00 UTC = 09:00 EST — 30 min before open.
+        self.assertFalse(
+            is_market_open(AssetClass.STOCK, _utc(2026, 1, 13, 14, 0)),
+        )
+
+    def test_est_post_close_closed(self) -> None:
+        # 21:00 UTC = 16:00 EST — exact close.
+        self.assertFalse(
+            is_market_open(AssetClass.STOCK, _utc(2026, 1, 13, 21, 0)),
+        )
+
+    # ---- Window helper -----------------------------------------------
+
+    def test_equity_session_window_edt(self) -> None:
+        open_utc, close_utc = equity_session_window(_utc(2026, 5, 26, 12, 0))
+        self.assertEqual((open_utc.hour, open_utc.minute), (13, 30))
+        self.assertEqual((close_utc.hour, close_utc.minute), (20, 0))
+
+    def test_equity_session_window_est(self) -> None:
+        open_utc, close_utc = equity_session_window(_utc(2026, 1, 13, 12, 0))
+        self.assertEqual((open_utc.hour, open_utc.minute), (14, 30))
+        self.assertEqual((close_utc.hour, close_utc.minute), (21, 0))
+
+    # ---- General invariants -----------------------------------------
+
     def test_weekend_closed(self) -> None:
-        # Saturday at 15:00 UTC — inside the time window but the wrong day.
+        # Saturday at 15:00 UTC — inside the EDT time window but wrong day.
         self.assertFalse(
             is_market_open(AssetClass.STOCK, _utc(2026, 5, 23, 15, 0)),
         )
 
-    def test_seconds_since_open_at_boundary(self) -> None:
-        # Exactly at open → 0 seconds.
+    def test_seconds_since_open_at_boundary_edt(self) -> None:
+        # Exactly at EDT open → 0 seconds.
         self.assertEqual(
             seconds_since_open(AssetClass.STOCK, _utc(2026, 5, 26, 13, 30)),
             0,
         )
-        # 30 minutes after open.
+        # 30 minutes after EDT open.
         self.assertEqual(
             seconds_since_open(AssetClass.STOCK, _utc(2026, 5, 26, 14, 0)),
             30 * 60,
@@ -108,12 +157,20 @@ class EquitySessionTests(unittest.TestCase):
         naive = datetime(2026, 5, 26, 15, 0)
         self.assertTrue(is_market_open(AssetClass.STOCK, naive))
 
-    def test_next_open_is_strictly_future_when_closed(self) -> None:
-        # Friday after close → next open is Monday.
+    def test_next_open_is_strictly_future_edt(self) -> None:
+        # Friday after EDT close → next open is Monday 13:30 UTC.
         state = session_state(AssetClass.STOCK, _utc(2026, 5, 22, 22, 0))
         assert state.next_open_utc is not None
         self.assertEqual(state.next_open_utc.weekday(), 0)
         self.assertEqual(state.next_open_utc.hour, 13)
+        self.assertEqual(state.next_open_utc.minute, 30)
+
+    def test_next_open_is_strictly_future_est(self) -> None:
+        # Friday after EST close → next open is Monday 14:30 UTC.
+        state = session_state(AssetClass.STOCK, _utc(2026, 1, 9, 22, 0))
+        assert state.next_open_utc is not None
+        self.assertEqual(state.next_open_utc.weekday(), 0)
+        self.assertEqual(state.next_open_utc.hour, 14)
         self.assertEqual(state.next_open_utc.minute, 30)
 
 

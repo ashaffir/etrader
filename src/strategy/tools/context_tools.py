@@ -15,6 +15,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from ...execution.exchange_session import exchange_label, session_for
 from ..indicators import momentum_pct, simple_moving_average
 from .base import AssetClass, Tool, ToolContext, ToolResult
 
@@ -68,18 +69,24 @@ class SpreadFilterTool(Tool):
 # ---------------------------------------------------------------------------
 
 class MarketHoursTool(Tool):
-    """Veto when traditional markets are closed (weekend / off-hours).
+    """Veto when the instrument's home exchange is closed.
 
-    Crypto trades 24/7 so it's exempt. For everything else we apply a
-    coarse heuristic (US session 13:30-21:00 UTC on weekdays). eToro
-    will reject the trade anyway when closed; this gate just avoids
-    burning an LLM call.
+    Crypto trades 24/7 so it's exempt. For every other asset class we
+    resolve the instrument's specific exchange from its
+    :class:`InstrumentMeta` (LSE, XETRA, HKEX, TSE, ASX, NYSE, …) so
+    a London stock can trade during London hours and a Tokyo stock
+    during Tokyo hours — not only when NY is open. Falls back to US
+    equity hours when meta is missing or carries an unknown
+    ``priceSource``.
+
+    See :mod:`src.execution.exchange_session` for the schedule
+    registry and DST handling.
     """
 
     name = "market_hours"
     family = "context"
     role = "gate"
-    purpose = "Veto trading outside session for non-crypto instruments"
+    purpose = "Veto BUY when the instrument's home exchange is closed"
     asset_classes = (
         AssetClass.STOCK, AssetClass.ETF, AssetClass.INDEX,
         AssetClass.COMMODITY, AssetClass.FX, AssetClass.OTHER,
@@ -87,20 +94,21 @@ class MarketHoursTool(Tool):
 
     def evaluate(self, ctx: ToolContext) -> ToolResult:
         now = datetime.now(timezone.utc)
-        weekday = now.weekday()  # Mon=0 … Sun=6
-        if ctx.asset_class == AssetClass.FX:
-            # FX runs ~24x5: closed Sat-Sun only.
-            is_open = weekday < 5
-        else:
-            in_session = (now.hour, now.minute) >= (13, 30) and now.hour < 21
-            is_open = weekday < 5 and in_session
-        if ctx.candidate_action == "BUY" and not is_open:
+        state = session_for(ctx.instrument_meta, ctx.asset_class, now)
+        label = state.exchange_label or exchange_label(
+            ctx.instrument_meta, ctx.asset_class,
+        )
+        if ctx.candidate_action == "BUY" and not state.is_open:
             return ToolResult(
-                features={"is_open": False, "now_utc": now.isoformat()},
+                features={
+                    "is_open": False,
+                    "exchange": label,
+                    "now_utc": now.isoformat(),
+                },
                 gate_passed=False,
-                gate_reason="market closed",
+                gate_reason=f"{label} closed",
             )
-        return ToolResult(features={"is_open": True})
+        return ToolResult(features={"is_open": True, "exchange": label})
 
 
 # ---------------------------------------------------------------------------

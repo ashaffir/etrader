@@ -1,0 +1,29 @@
+---
+description: Keep answers short and to the point unless elaboration is explicitly requested
+alwaysApply: true
+---
+
+# Concise Answers
+
+- Default to **short, direct answers**. One sentence is often enough.
+- No preambles ("Great question!", "Let me explain…").
+- No recap of what the user just said.
+- No closing summaries restating the answer.
+- Skip the "here's what I did" wrap-up after tool calls unless something needs attention.
+- Bullet lists only when the answer truly has multiple items; otherwise prose.
+
+## Elaborate ONLY when
+
+- The user explicitly asks ("explain", "in detail", "walk me through", "why").
+- The task is a non-trivial code change where the diff alone isn't self-explanatory.
+- There's a risk, trade-off, or surprise the user needs to know before acting.
+
+## Examples
+
+User: "Did the tests pass?"
+- BAD: "Yes, I ran the full suite of 706 tests and all of them passed successfully, which confirms…"
+- GOOD: "Yes — 706/706."
+
+User: "Why did you choose SQLite?"
+- BAD: "SQLite is good."
+- GOOD: One paragraph covering the trade-offs (this question explicitly asks why).

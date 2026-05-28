@@ -167,13 +167,17 @@ class HoldCeilingTests(unittest.TestCase):
 
 
 class NoOvernightTests(unittest.TestCase):
-    # 20:58 UTC is 2 min before US equity close at 21:00. Within the
-    # default 5-min flatten window.
-    IN_WINDOW = datetime(2026, 5, 27, 20, 58, 0, tzinfo=timezone.utc)
-    # 13:35 UTC is just after open, well outside the close window.
+    # 19:58 UTC = 15:58 EDT = 2 min before US equity close on 2026-05-27
+    # (NY summer time). Within the default 5-min flatten window.
+    # (Pre-DST-fix the close was hard-coded to 21:00 UTC, which was
+    # an hour AFTER the real EDT bell — captured by these tests.)
+    IN_WINDOW = datetime(2026, 5, 27, 19, 58, 0, tzinfo=timezone.utc)
+    # Equivalent EST scenario: 20:58 UTC on 2026-01-13 (NY winter).
+    IN_WINDOW_EST = datetime(2026, 1, 13, 20, 58, 0, tzinfo=timezone.utc)
+    # 13:35 UTC = 09:35 EDT — 5 min after the open, well outside close.
     NOT_IN_WINDOW = datetime(2026, 5, 27, 13, 35, 0, tzinfo=timezone.utc)
     # Saturday → market closed, no flatten.
-    WEEKEND = datetime(2026, 5, 30, 20, 58, 0, tzinfo=timezone.utc)
+    WEEKEND = datetime(2026, 5, 30, 19, 58, 0, tzinfo=timezone.utc)
 
     def test_emits_close_for_equity_in_window(self) -> None:
         directives = Directives(no_overnight=True)
@@ -186,6 +190,42 @@ class NoOvernightTests(unittest.TestCase):
         )
         self.assertEqual(len(reqs), 1)
         self.assertEqual(notes[0]["directive"], "no_overnight")
+
+    def test_emits_close_for_equity_in_window_est(self) -> None:
+        """Same scenario in NY winter time — close shifts to 21:00 UTC."""
+        directives = Directives(no_overnight=True)
+        reqs, notes = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=[_FakePos(2001, 99)],
+            symbol_for_id={99: "AAPL"},
+            instrument_metas={},
+            now=self.IN_WINDOW_EST,
+        )
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(notes[0]["directive"], "no_overnight")
+
+    def test_emits_close_after_real_edt_bell(self) -> None:
+        """Regression: 20:30 UTC on an EDT trading day is 30 min AFTER
+        the real US bell (16:00 EDT = 20:00 UTC).
+
+        ``no_overnight`` is a hard rule: the bot must not hold equity
+        positions outside the regular session. So even after the bell
+        has rung, the bot should keep emitting CLOSE requests on every
+        cycle until it manages to exit — covering the case where the
+        bot was offline during the pre-bell flatten window.
+        """
+        directives = Directives(no_overnight=True)
+        after_bell = datetime(2026, 5, 27, 20, 30, 0, tzinfo=timezone.utc)
+        reqs, notes = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=[_FakePos(2099, 99)],
+            symbol_for_id={99: "AAPL"},
+            instrument_metas={},
+            now=after_bell,
+        )
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(notes[0]["directive"], "no_overnight")
+        self.assertIn("closed", notes[0]["reason"])
 
     def test_skips_crypto_in_window(self) -> None:
         directives = Directives(no_overnight=True)
@@ -210,12 +250,48 @@ class NoOvernightTests(unittest.TestCase):
         )
         self.assertEqual(reqs, [])
 
-    def test_no_close_on_weekend(self) -> None:
+    def test_emits_close_on_weekend(self) -> None:
+        """Weekend = US market closed → the bot must flatten any
+        carried-over equity position. This covers the "bot wakes up
+        Saturday morning with stale longs" scenario.
+        """
         directives = Directives(no_overnight=True)
-        reqs, _notes = build_directive_close_requests(
+        reqs, notes = build_directive_close_requests(
             directives=directives,
             bot_owned_positions=[_FakePos(2004, 99)],
             symbol_for_id={99: "AAPL"},
+            instrument_metas={},
+            now=self.WEEKEND,
+        )
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(notes[0]["directive"], "no_overnight")
+        self.assertIn("closed", notes[0]["reason"])
+
+    def test_emits_close_pre_market(self) -> None:
+        """Pre-market (07:00 UTC on a weekday) = market not open yet
+        → flatten any leftover overnight position.
+        """
+        directives = Directives(no_overnight=True)
+        pre_market = datetime(2026, 5, 28, 7, 0, 0, tzinfo=timezone.utc)
+        reqs, notes = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=[_FakePos(2010, 99)],
+            symbol_for_id={99: "AAPL"},
+            instrument_metas={},
+            now=pre_market,
+        )
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(notes[0]["directive"], "no_overnight")
+
+    def test_skips_crypto_when_market_closed(self) -> None:
+        """Crypto trades 24/7 — closing the equity market doesn't
+        require flattening crypto positions.
+        """
+        directives = Directives(no_overnight=True)
+        reqs, _notes = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=[_FakePos(2011, 999)],
+            symbol_for_id={999: "BTC"},
             instrument_metas={},
             now=self.WEEKEND,
         )
@@ -233,8 +309,104 @@ class NoOvernightTests(unittest.TestCase):
         self.assertEqual(reqs, [])
 
 
+class PerExchangeFlattenTests(unittest.TestCase):
+    """Each exchange has its own flatten window — a position on LSE
+    shouldn't be force-closed while LSE is mid-session just because
+    NY happens to be closed."""
+
+    @staticmethod
+    def _meta(price_source: str) -> object:
+        m = type("_M", (), {})()
+        m.price_source = price_source
+        # asset_class_for() also reads stocks_industry_id /
+        # instrument_type_id; setting price_source on its own
+        # routes to STOCK (via _EQUITY_PRICE_SOURCES).
+        m.stocks_industry_id = 1
+        m.instrument_type_id = 5
+        m.symbol_full = None
+        return m
+
+    def test_lse_position_not_flattened_during_lse_hours(self) -> None:
+        """11:00 UTC = 12:00 BST (LSE open) — bot must NOT close an LSE position."""
+        directives = Directives(no_overnight=True)
+        now = datetime(2026, 6, 17, 11, 0, tzinfo=timezone.utc)
+        metas = {99: self._meta("lse")}
+        reqs, _ = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=[_FakePos(8001, 99)],
+            symbol_for_id={99: "VOD"},
+            instrument_metas=metas,
+            now=now,
+        )
+        self.assertEqual(reqs, [])
+
+    def test_lse_position_flattened_after_lse_close(self) -> None:
+        """17:00 UTC = 18:00 BST — LSE closed at 16:30 BST, bot flattens."""
+        directives = Directives(no_overnight=True)
+        now = datetime(2026, 6, 17, 17, 0, tzinfo=timezone.utc)
+        metas = {99: self._meta("lse")}
+        reqs, notes = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=[_FakePos(8002, 99)],
+            symbol_for_id={99: "VOD"},
+            instrument_metas=metas,
+            now=now,
+        )
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(notes[0]["directive"], "no_overnight")
+        self.assertIn("LSE", notes[0]["reason"])
+
+    def test_hkex_position_not_flattened_during_hk_hours(self) -> None:
+        """05:00 UTC = 13:00 HKT — HKEX open; NY closed. Position stays."""
+        directives = Directives(no_overnight=True)
+        now = datetime(2026, 6, 17, 5, 0, tzinfo=timezone.utc)
+        metas = {77: self._meta("hkex")}
+        reqs, _ = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=[_FakePos(8003, 77)],
+            symbol_for_id={77: "0700.HK"},
+            instrument_metas=metas,
+            now=now,
+        )
+        self.assertEqual(reqs, [])
+
+    def test_tse_position_not_flattened_during_tokyo_hours(self) -> None:
+        """03:00 UTC = 12:00 JST — TSE open."""
+        directives = Directives(no_overnight=True)
+        now = datetime(2026, 6, 17, 3, 0, tzinfo=timezone.utc)
+        metas = {55: self._meta("tse")}
+        reqs, _ = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=[_FakePos(8004, 55)],
+            symbol_for_id={55: "7203.T"},
+            instrument_metas=metas,
+            now=now,
+        )
+        self.assertEqual(reqs, [])
+
+    def test_nyse_and_lse_positions_treated_independently(self) -> None:
+        """11:00 UTC = LSE in-session, NYSE pre-market. Only NYSE position flattens."""
+        directives = Directives(no_overnight=True)
+        now = datetime(2026, 6, 17, 11, 0, tzinfo=timezone.utc)
+        metas = {
+            99: self._meta("lse"),
+            42: self._meta("nyse"),
+        }
+        reqs, notes = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=[_FakePos(9001, 99), _FakePos(9002, 42)],
+            symbol_for_id={99: "VOD", 42: "AAPL"},
+            instrument_metas=metas,
+            now=now,
+        )
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(reqs[0].position_id, 9002)  # NYSE one only
+        self.assertIn("NYSE", notes[0]["reason"])
+
+
 class CombinedRulesTests(unittest.TestCase):
-    NOW = datetime(2026, 5, 27, 20, 58, 0, tzinfo=timezone.utc)
+    # 19:58 UTC on 2026-05-27 = 15:58 EDT, 2 min before US bell.
+    NOW = datetime(2026, 5, 27, 19, 58, 0, tzinfo=timezone.utc)
 
     def test_no_duplicate_close_when_both_rules_apply(self) -> None:
         directives = Directives(

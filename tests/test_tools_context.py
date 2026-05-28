@@ -69,6 +69,69 @@ class MarketHoursTests(unittest.TestCase):
         # CRYPTO is intentionally excluded from MarketHoursTool's asset_classes.
         self.assertFalse(MarketHoursTool().applies_to(ctx))
 
+    def _meta(self, price_source: str) -> object:
+        # Minimal stub matching ``InstrumentMeta.price_source`` access.
+        meta = type("_M", (), {})()
+        meta.price_source = price_source
+        return meta
+
+    def _ctx_with_meta(self, *, price_source: str, action: str = "BUY"):
+        ctx = _ctx([100.0] * 5, action=action)
+        ctx.instrument_meta = self._meta(price_source)
+        return ctx
+
+    def test_lse_buy_allowed_during_london_hours(self) -> None:
+        """LSE 10:00 BST (= 09:00 UTC in June) is in-session even though NY is closed."""
+        import datetime as _dt
+        from unittest.mock import patch
+
+            # 09:00 UTC = 10:00 BST (LSE open) AND 05:00 EDT (NY pre-market).
+        fixed = _dt.datetime(2026, 6, 17, 9, 0, tzinfo=_dt.timezone.utc)
+        ctx = self._ctx_with_meta(price_source="lse")
+        with patch("src.strategy.tools.context_tools.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed
+            result = MarketHoursTool().evaluate(ctx)
+        self.assertTrue(result.gate_passed)
+        self.assertEqual(result.features["exchange"], "LSE")
+
+    def test_hkex_buy_allowed_during_hk_hours(self) -> None:
+        """05:00 UTC = 13:00 HKT — HKEX in session, NY closed."""
+        import datetime as _dt
+        from unittest.mock import patch
+
+        fixed = _dt.datetime(2026, 6, 17, 5, 0, tzinfo=_dt.timezone.utc)
+        ctx = self._ctx_with_meta(price_source="hkex")
+        with patch("src.strategy.tools.context_tools.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed
+            result = MarketHoursTool().evaluate(ctx)
+        self.assertTrue(result.gate_passed)
+        self.assertEqual(result.features["exchange"], "HKEX")
+
+    def test_nyse_buy_vetoed_outside_nyse_hours(self) -> None:
+        """22:00 UTC = 18:00 EDT — past NYSE close, BUY rejected."""
+        import datetime as _dt
+        from unittest.mock import patch
+
+        fixed = _dt.datetime(2026, 6, 17, 22, 0, tzinfo=_dt.timezone.utc)
+        ctx = self._ctx_with_meta(price_source="nasdaq")
+        with patch("src.strategy.tools.context_tools.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed
+            result = MarketHoursTool().evaluate(ctx)
+        self.assertFalse(result.gate_passed)
+        self.assertIn("NASDAQ", result.gate_reason)
+
+    def test_unknown_price_source_falls_back_to_us_hours(self) -> None:
+        """Defensive default: BUY allowed at NY 10:00 even with unknown exchange."""
+        import datetime as _dt
+        from unittest.mock import patch
+
+        fixed = _dt.datetime(2026, 6, 17, 14, 0, tzinfo=_dt.timezone.utc)  # 10:00 EDT
+        ctx = self._ctx_with_meta(price_source="never_heard_of_it")
+        with patch("src.strategy.tools.context_tools.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed
+            result = MarketHoursTool().evaluate(ctx)
+        self.assertTrue(result.gate_passed)
+
 
 class HigherTfTrendTests(unittest.TestCase):
     def test_trend_unknown_when_too_few_bars(self) -> None:
