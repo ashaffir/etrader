@@ -122,6 +122,7 @@ class TradingBot:
         self._fundamentals = self._build_fundamentals_cache()
         if self._fundamentals is not None:
             self.controller.set_fundamentals(self._fundamentals)
+        self._earnings_calendar = self._build_earnings_calendar()
         self._autotune = self._build_autotune_state()
         self.controller.set_autotune_state(self._autotune)
         self._performance = PerformanceTracker(
@@ -304,6 +305,7 @@ class TradingBot:
             alerts=self.alerts,
             news_scheduler=self._news_scheduler,
             fundamentals_cache=self._fundamentals,
+            earnings_calendar=self._earnings_calendar,
             autotune_state=self._autotune,
             performance=self._performance,
             dynamic_stops=dynamic_stops,
@@ -376,6 +378,29 @@ class TradingBot:
         self.log.info(
             "[fundamentals] cache ready (%d entries at %s)",
             len(cache), cache.path,
+        )
+        return cache
+
+    def _build_earnings_calendar(self) -> "EarningsCalendarCache | None":
+        """Wire the yfinance-backed earnings-date cache.
+
+        Returns ``None`` when ``[earnings_calendar] enabled = false``
+        so the proximity tool and pre-earnings rules become no-ops.
+        """
+        cfg = self.cfg.earnings_calendar
+        if not cfg.enabled:
+            self.log.info("[earnings] calendar disabled in config")
+            return None
+        from .strategy.earnings_calendar import EarningsCalendarCache
+
+        cache = EarningsCalendarCache(
+            self._project_root / cfg.cache_path,
+            ttl_seconds=int(cfg.ttl_hours * 3600),
+            logger=get_logger("earnings", tag="earn"),
+        )
+        self.log.info(
+            "[earnings] calendar ready (%d cached entries at %s)",
+            len(cache.snapshot()), self._project_root / cfg.cache_path,
         )
         return cache
 

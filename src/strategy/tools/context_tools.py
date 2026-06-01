@@ -217,6 +217,70 @@ class RelativeStrengthTool(Tool):
         )
 
 
+class EarningsProximityTool(Tool):
+    """Annotate (and optionally gate) candidates near their earnings call.
+
+    Free, yfinance-backed. Reads ``ctx.earnings_lookup(symbol)`` to get
+    the next scheduled earnings event for the candidate and emits
+
+    * ``hours_to_earnings`` / ``days_to_earnings`` features so the LLM
+      can size conviction down or skip near-earnings names;
+    * a gate veto on BUYs when ``guardrails.pre_earnings_buy_blackout_hours``
+      is set and the candidate is inside the blackout window.
+
+    Crypto and FX skip this tool — earnings risk is an equity concept.
+    The tool is a no-op when no lookup is wired (operator hasn't
+    enabled the calendar) so the rest of the strategy keeps working.
+    """
+
+    name = "earnings_proximity"
+    family = "context"
+    role = "both"
+    purpose = "Veto / annotate BUYs near a scheduled earnings call"
+    asset_classes = (
+        AssetClass.STOCK, AssetClass.ETF, AssetClass.INDEX,
+        AssetClass.COMMODITY, AssetClass.OTHER,
+    )
+
+    def evaluate(self, ctx: ToolContext) -> ToolResult:
+        lookup = getattr(ctx, "earnings_lookup", None)
+        if lookup is None:
+            return ToolResult(features={"hours_to_earnings": None})
+        try:
+            entry = lookup(ctx.symbol)
+        except Exception:  # noqa: BLE001 — defensive: never break a cycle
+            return ToolResult(features={"hours_to_earnings": None})
+        if entry is None:
+            return ToolResult(features={"hours_to_earnings": None})
+
+        now = datetime.now(timezone.utc)
+        hours = entry.hours_until(now)
+        # Anything past the bell is irrelevant for the next-earnings
+        # gate; the cache should have rolled the entry but be defensive.
+        if hours < 0:
+            return ToolResult(features={"hours_to_earnings": None})
+
+        features: dict[str, Any] = {
+            "hours_to_earnings": round(hours, 1),
+            "days_to_earnings": int(hours // 24),
+            "next_earnings_utc": entry.earnings_at_utc.isoformat(),
+        }
+        blackout = int(getattr(ctx.guardrails, "pre_earnings_buy_blackout_hours", 0) or 0)
+        if (
+            ctx.candidate_action == "BUY"
+            and blackout > 0
+            and hours <= blackout
+        ):
+            return ToolResult(
+                features=features,
+                gate_passed=False,
+                gate_reason=(
+                    f"earnings in {hours:.1f}h ≤ blackout {blackout}h"
+                ),
+            )
+        return ToolResult(features=features)
+
+
 def build_tools() -> list[Tool]:
     return [
         SpreadFilterTool(),
@@ -224,4 +288,5 @@ def build_tools() -> list[Tool]:
         HigherTfTrendTool(),
         CrossAssetRegimeTool(),
         RelativeStrengthTool(),
+        EarningsProximityTool(),
     ]

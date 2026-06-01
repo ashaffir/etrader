@@ -140,6 +140,7 @@ class ToolOrchestrator:
         instrument_metas: Mapping[int, InstrumentMeta],
         higher_tf_candles: Mapping[int, Sequence[Candle]] | None = None,
         cycle_index: int = 0,
+        earnings_lookup: Any | None = None,
     ) -> dict[int, ToolRunResult]:
         results: dict[int, ToolRunResult] = {}
         regime_dict = (
@@ -164,6 +165,7 @@ class ToolOrchestrator:
                 instrument_meta=meta,
                 higher_tf_candles=list((higher_tf_candles or {}).get(inst_id) or []),
                 cross_asset_regime=regime_dict,
+                earnings_lookup=earnings_lookup,
             )
             instrument_regime = detect_instrument_regime(candles).label
             run_result = self._runner.run(ctx=ctx, regime=instrument_regime)

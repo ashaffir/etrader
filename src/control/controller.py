@@ -408,6 +408,9 @@ class BotController:
         "default_stop_loss_pct",
         "default_take_profit_pct",
         "max_leverage",
+        "max_bot_invested_usd",
+        "min_amend_remainder_usd",
+        "pre_earnings_buy_blackout_hours",
     )
 
     @staticmethod

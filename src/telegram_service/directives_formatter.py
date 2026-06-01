@@ -38,6 +38,10 @@ def format_directives(payload: Mapping[str, Any]) -> str:
         f"{_fmt_zero_disabled_money(values.get('max_total_account_invested_usd'))}"
     )
     lines.append(
+        f"pre_earnings_close_hours    : "
+        f"{_fmt_zero_disabled_int(values.get('pre_earnings_close_hours'))}"
+    )
+    lines.append(
         f"blocked_symbols             : "
         f"{_fmt_list(values.get('blocked_symbols'))}"
     )
@@ -66,6 +70,7 @@ def format_directives(payload: Mapping[str, Any]) -> str:
     lines.append("  /directive set hold_ceiling_minutes 120")
     lines.append("  /directive set blocked_symbols NVDA,TSLA")
     lines.append("  /directive set max_total_account_invested_usd 3000")
+    lines.append("  /directive set pre_earnings_close_hours 24")
     lines.append("  /note add Prefer financial-sector names this week.")
     return "\n".join(lines)
 

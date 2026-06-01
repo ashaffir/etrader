@@ -124,6 +124,11 @@ class ToolContext:
     higher_tf_candles: Sequence[Candle] = ()    # daily candles, may be empty
     cross_asset_regime: Mapping[str, Any] | None = None
     feed_summary: Mapping[str, Any] | None = None  # filled by feed tool
+    # Optional callable ``(symbol) -> EarningsEntry | None`` injected
+    # by the cycle runner. When wired, :class:`EarningsProximityTool`
+    # uses it to gate / annotate candidates near their earnings call.
+    # Stays untyped here to avoid a strategy ↔ tools import cycle.
+    earnings_lookup: Any | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property

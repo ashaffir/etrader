@@ -432,5 +432,89 @@ class CombinedRulesTests(unittest.TestCase):
         self.assertEqual(notes[0]["directive"], "hold_ceiling_minutes")
 
 
+class PreEarningsCloseTests(unittest.TestCase):
+    """``pre_earnings_close_hours`` directive — flatten near earnings."""
+
+    NOW = datetime(2026, 5, 27, 14, 0, 0, tzinfo=timezone.utc)
+
+    def _lookup(self, *, hours_until: float):
+        from datetime import timedelta as _td
+        from src.strategy.earnings_calendar import EarningsEntry
+
+        when = self.NOW + _td(hours=hours_until)
+        entry = EarningsEntry(
+            symbol="AAPL",
+            earnings_at_utc=when,
+            fetched_at_unix=self.NOW.timestamp(),
+        )
+
+        def get(_sym: str):
+            return entry
+
+        return get
+
+    def test_fires_inside_window(self) -> None:
+        directives = Directives(pre_earnings_close_hours=24)
+        reqs, notes = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=[_FakePos(4001, 42)],
+            symbol_for_id={42: "AAPL"},
+            instrument_metas={},
+            now=self.NOW,
+            earnings_lookup=self._lookup(hours_until=12.0),
+        )
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(notes[0]["directive"], "pre_earnings_close_hours")
+        self.assertIn("earnings", notes[0]["reason"])
+
+    def test_silent_outside_window(self) -> None:
+        directives = Directives(pre_earnings_close_hours=24)
+        reqs, _notes = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=[_FakePos(4002, 42)],
+            symbol_for_id={42: "AAPL"},
+            instrument_metas={},
+            now=self.NOW,
+            earnings_lookup=self._lookup(hours_until=72.0),
+        )
+        self.assertEqual(reqs, [])
+
+    def test_disabled_when_threshold_zero(self) -> None:
+        directives = Directives(pre_earnings_close_hours=0)
+        reqs, _notes = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=[_FakePos(4003, 42)],
+            symbol_for_id={42: "AAPL"},
+            instrument_metas={},
+            now=self.NOW,
+            earnings_lookup=self._lookup(hours_until=2.0),
+        )
+        self.assertEqual(reqs, [])
+
+    def test_skips_crypto(self) -> None:
+        directives = Directives(pre_earnings_close_hours=24)
+        reqs, _notes = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=[_FakePos(4004, 99)],
+            symbol_for_id={99: "BTC"},
+            instrument_metas={},
+            now=self.NOW,
+            earnings_lookup=self._lookup(hours_until=2.0),
+        )
+        self.assertEqual(reqs, [])
+
+    def test_no_lookup_no_close(self) -> None:
+        directives = Directives(pre_earnings_close_hours=24)
+        reqs, _notes = build_directive_close_requests(
+            directives=directives,
+            bot_owned_positions=[_FakePos(4005, 42)],
+            symbol_for_id={42: "AAPL"},
+            instrument_metas={},
+            now=self.NOW,
+            earnings_lookup=None,
+        )
+        self.assertEqual(reqs, [])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

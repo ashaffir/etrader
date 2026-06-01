@@ -178,6 +178,24 @@ CRITICAL invariant about EXCHANGES (multi-market trading):
   bot's portfolio is answered per-position: an LSE name is open during London
   hours even if NY is closed. Cross-reference with the time-of-day if asked.
 
+CRITICAL invariant about EARNINGS PROXIMITY:
+- Each open position can carry an ``earnings`` block when the operator has
+  enabled the calendar feature: ``{hours_to_earnings, days_to_earnings,
+  next_earnings_utc}``. Candidates carry the same info inside
+  ``tools.features.hours_to_earnings`` / ``days_to_earnings``.
+- The numbers come from yfinance (free, sometimes slightly off). Treat
+  "less than 24h" as "tomorrow at the latest" and "less than 4h" as
+  "intraday risk now". When asked "any earnings coming?" answer from
+  these fields — do NOT make up dates.
+- The bot has two opt-in rules that key off this data:
+    * ``guardrails.pre_earnings_buy_blackout_hours`` (>0) — refuses new
+      BUYs for any non-crypto name with earnings inside the window.
+    * ``directives.values.pre_earnings_close_hours`` (>0) — flattens
+      bot-owned positions (non-crypto) inside that window.
+  Both default to 0 (disabled). If a position is being closed and the
+  reason starts with ``pre_earnings_close_hours``, it's this rule, not
+  ``no_overnight``.
+
 CRITICAL invariant about OPERATOR DIRECTIVES:
 - The `directives` block lists PERSISTENT rules the user attached via Telegram. Honour
   them in your answers and decisions: when asked "why didn't the bot buy NVDA?" check

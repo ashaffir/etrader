@@ -103,6 +103,7 @@ def build_directive_close_requests(
     open_states: dict[int, OpenTradeState] | None = None,
     now: datetime,
     flatten_window_seconds: int = DEFAULT_FLATTEN_WINDOW_SECONDS,
+    earnings_lookup: Any | None = None,
 ) -> tuple[list[TradeRequest], list[dict[str, Any]]]:
     """Build CLOSE requests for directive-driven exits.
 
@@ -174,6 +175,21 @@ def build_directive_close_requests(
                 meta=meta, asset_class=asset_class, now=now,
                 window_seconds=flatten_window_seconds,
             )
+        elif (
+            directives.pre_earnings_close_hours > 0
+            and earnings_lookup is not None
+            and asset_class != AssetClass.CRYPTO
+        ):
+            entry = _safe_lookup_earnings(earnings_lookup, symbol)
+            if entry is not None:
+                hours_to = entry.hours_until(now)
+                threshold = float(directives.pre_earnings_close_hours)
+                if 0 <= hours_to <= threshold:
+                    directive = "pre_earnings_close_hours"
+                    reason = (
+                        f"earnings in {hours_to:.1f}h ≤ "
+                        f"{int(threshold)}h pre-earnings window"
+                    )
 
         if reason is None or directive is None:
             continue
@@ -222,6 +238,21 @@ def _held_seconds(
     if elapsed < 0:
         return 0
     return int(elapsed)
+
+
+def _safe_lookup_earnings(lookup: Any, symbol: str) -> Any | None:
+    """Run ``lookup(symbol)`` defensively.
+
+    The earnings-calendar cache fetcher must never break a cycle. We
+    swallow any unexpected exception (yfinance import error, schema
+    drift, JSON corruption …) and behave as if the symbol simply has
+    no scheduled earnings — the worst-case is that the bot misses a
+    pre-earnings flatten on one cycle, not that the loop crashes.
+    """
+    try:
+        return lookup(symbol)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _position_needs_flatten(

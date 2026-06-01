@@ -26,6 +26,7 @@ def enrich_owned_position(
     dynamic_band: Any | None,
     review: Any | None,
     meta: Any | None = None,
+    earnings_lookup: Any | None = None,
     now_epoch: float | None = None,
 ) -> dict[str, Any]:
     """Return a single bot-owned-position dict for the LLM payload.
@@ -83,7 +84,40 @@ def enrich_owned_position(
             "triggers": triggers,
             "notes": notes,
         }
+    if earnings_lookup is not None:
+        proximity = _earnings_proximity(earnings_lookup, symbol)
+        if proximity is not None:
+            out["earnings"] = proximity
     return out
+
+
+def _earnings_proximity(
+    lookup: Any, symbol: str
+) -> dict[str, Any] | None:
+    """Resolve the next earnings event for ``symbol`` defensively.
+
+    Returns a small dict suitable for direct inclusion in an LLM payload
+    or ``None`` when the lookup yields nothing / fails. The bot's
+    cycle layer should pass this in only when the earnings calendar
+    is enabled.
+    """
+    try:
+        entry = lookup(symbol)
+    except Exception:  # noqa: BLE001 — never break a cycle
+        return None
+    if entry is None:
+        return None
+    try:
+        hours = float(entry.hours_until())
+    except Exception:  # noqa: BLE001 — defensive: entry shape could drift
+        return None
+    if hours < 0:
+        return None
+    return {
+        "hours_to_earnings": round(hours, 1),
+        "days_to_earnings": int(hours // 24),
+        "next_earnings_utc": entry.earnings_at_utc.isoformat(),
+    }
 
 
 def project_bot_owned_positions(
@@ -94,6 +128,7 @@ def project_bot_owned_positions(
     dynamic_stops: Any | None = None,
     reviews_by_position_id: Mapping[int, Any] | None = None,
     instrument_metas: Mapping[int, Any] | None = None,
+    earnings_lookup: Any | None = None,
     now_epoch: float | None = None,
 ) -> list[dict[str, Any]]:
     """Build the ``bot_owned_positions`` block for the decision prompt.
@@ -121,6 +156,7 @@ def project_bot_owned_positions(
                 dynamic_band=band,
                 review=review_map.get(pos.position_id),
                 meta=metas.get(pos.instrument_id),
+                earnings_lookup=earnings_lookup,
                 now_epoch=now_epoch,
             )
         )

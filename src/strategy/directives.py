@@ -76,6 +76,13 @@ class Directives:
     # bot is forbidden from touching those.
     max_total_account_invested_usd: float = 0.0
 
+    # Flatten any non-crypto bot-owned position when its next
+    # scheduled earnings call is inside this window (hours). Same
+    # rationale as ``no_overnight``: earnings gaps are a fundamental
+    # gamble the bot can't predict. 0 = disabled. Requires the
+    # earnings calendar to be enabled in ``[earnings_calendar]``.
+    pre_earnings_close_hours: int = 0
+
     # Free-text soft directives. Surfaced to the LLM verbatim in
     # every decision prompt. Bounded by :data:`NOTES_MAX_CHARS`.
     notes: str = ""
@@ -89,6 +96,7 @@ class Directives:
             "max_total_account_invested_usd": float(
                 self.max_total_account_invested_usd
             ),
+            "pre_earnings_close_hours": int(self.pre_earnings_close_hours),
             "notes": str(self.notes or ""),
         }
 
@@ -103,6 +111,9 @@ class Directives:
             blocked_sectors=_coerce_label_tuple(payload.get("blocked_sectors")),
             max_total_account_invested_usd=_coerce_nonneg_float(
                 payload.get("max_total_account_invested_usd")
+            ),
+            pre_earnings_close_hours=_coerce_nonneg_int(
+                payload.get("pre_earnings_close_hours")
             ),
             notes=_coerce_notes(payload.get("notes")),
         )
@@ -130,6 +141,7 @@ STRUCTURED_KEYS: tuple[str, ...] = (
     "blocked_symbols",
     "blocked_sectors",
     "max_total_account_invested_usd",
+    "pre_earnings_close_hours",
 )
 
 _FIELD_TYPES: dict[str, str] = {
@@ -138,6 +150,7 @@ _FIELD_TYPES: dict[str, str] = {
     "blocked_symbols": "symbol_list",
     "blocked_sectors": "label_list",
     "max_total_account_invested_usd": "float",
+    "pre_earnings_close_hours": "int",
 }
 
 

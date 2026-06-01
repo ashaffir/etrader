@@ -32,6 +32,7 @@ max_parallel_trades        = 10      # max simultaneous open positions opened by
 max_bot_invested_usd       = 2000.0
 min_amend_remainder_usd    = 50.0    # floor under which budget-amended BUYs are rejected, not shrunk further
 daily_loss_stop_usd        = 0.0     # 0 = disabled (always-on mode); set >0 to halt new opens if today's drawdown ≥ this vs. session start
+pre_earnings_buy_blackout_hours = 0  # 0 = disabled; >0 = refuse BUYs for any non-crypto name with earnings within this many hours (needs [earnings_calendar] enabled = true)
 per_instrument_cooldown_min = 60     # after closing/opening on an instrument, ignore it for N minutes
 default_stop_loss_pct      = 5.0     # SL distance from entry (% of entry price)
 default_take_profit_pct    = 8.0     # TP distance from entry (% of entry price)
@@ -193,6 +194,23 @@ refresh_after_hours      = 24.0
 failure_backoff_hours    = 6.0
 budget_per_refresh       = 8
 enrich_decision_prompt   = true
+
+# ---------------------------------------------------------------------
+# [earnings_calendar] yfinance-backed next-earnings cache
+# ---------------------------------------------------------------------
+# Free data. When enabled, every tracked symbol gets its next
+# scheduled earnings date refreshed from yfinance (with a TTL so we
+# don't hammer Yahoo). The data flows into:
+#   * candidates: ``tools.features.hours_to_earnings``
+#   * open positions: ``earnings.{hours_to,days_to,next_earnings_utc}``
+#   * the optional ``pre_earnings_buy_blackout_hours`` guardrail
+#   * the optional ``pre_earnings_close_hours`` directive
+# The feature is DISABLED by default — flip ``enabled`` to opt in.
+[earnings_calendar]
+enabled            = false
+cache_path         = "data/earnings_cache.json"
+ttl_hours          = 12.0
+budget_per_refresh = 6
 
 # ---------------------------------------------------------------------
 # [strategy] price-tool ensemble (entry / exit candidacy)

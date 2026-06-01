@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Any, Iterable
 
 from .ai.azure_client import AzureFoundryClient
 from .ai.decision_context import (
@@ -50,6 +50,7 @@ from .strategy.directives import Directives, DirectivesStore
 from .strategy.position_review import PositionReviewer
 from .strategy.tools.base import AssetClass, asset_class_for
 from .fundamentals import FundamentalsCache
+from .strategy.earnings_calendar import EarningsCalendarCache
 from .news.scheduler import NewsScheduler
 from .state import BotState
 from .strategy.autotune import AutotuneState
@@ -102,6 +103,7 @@ class CycleRunner:
         alerts: AlertHub | None = None,
         news_scheduler: NewsScheduler | None = None,
         fundamentals_cache: FundamentalsCache | None = None,
+        earnings_calendar: "EarningsCalendarCache | None" = None,
         autotune_state: AutotuneState | None = None,
         performance: PerformanceTracker | None = None,
         dynamic_stops: "DynamicStopsStore | None" = None,
@@ -128,6 +130,13 @@ class CycleRunner:
         # up on every universe refresh and project a trim dict into
         # the LLM decision prompt for each candidate.
         self._fundamentals = fundamentals_cache
+        # Optional earnings calendar. When present:
+        # 1. universe-refresh top-ups stale entries (budget-capped);
+        # 2. ToolContext gets a ``lookup(symbol)`` callable so the
+        #    EarningsProximityTool can gate / annotate BUYs;
+        # 3. directive_enforcer reads it to fire
+        #    ``pre_earnings_close_hours`` on open bot positions.
+        self._earnings_calendar = earnings_calendar
         # Autonomous-tuner overlay. When present, every cycle:
         # 1. raw_score histogram is folded in via observe_cycle();
         # 2. evidence digest is passed to the LLM decision call;
@@ -161,6 +170,21 @@ class CycleRunner:
         self._last_halted: bool = False
         self._last_universe_symbols: tuple[str, ...] = ()
 
+    @property
+    def _earnings_lookup(self) -> Any | None:
+        """Return a ``(symbol) -> EarningsEntry | None`` callable.
+
+        Centralised so every consumer (tool orchestrator, directive
+        enforcer, …) gets the same closure and the rest of the cycle
+        code doesn't need to know whether the calendar feature is
+        enabled. ``None`` when no calendar is wired so callers can
+        skip cheaply.
+        """
+        cal = self._earnings_calendar
+        if cal is None:
+            return None
+        return cal.get
+
     def initial_universe(self) -> CycleContext:
         # First news scan happens before the first universe build so the
         # candidate store is warm. Forced run on boot — operators expect
@@ -176,6 +200,7 @@ class CycleRunner:
         self._log.info("[universe] initial → %s", universe.summary_line())
         self._cache_instrument_metadata(universe, ctx.instrument_metas)
         self._refresh_fundamentals(universe)
+        self._refresh_earnings_calendar(universe)
         self._publish_universe(universe)
         # Seed the diff baseline so the first refresh isn't reported as a
         # "universe changed" alert.
@@ -281,6 +306,7 @@ class CycleRunner:
                 rates=rates,
                 instrument_metas=ctx.instrument_metas,
                 cycle_index=self._state.cycle_count,
+                earnings_lookup=self._earnings_lookup,
             )
             gated = [
                 (cand.symbol, tool_results[cand.instrument_id].gate_reason)
@@ -321,6 +347,7 @@ class CycleRunner:
             dynamic_stops=self._dynamic_stops,
             reviews_by_position_id=reviews_by_pos,
             instrument_metas=ctx.instrument_metas,
+            earnings_lookup=self._earnings_lookup,
         )
         by_symbol_proj = self._build_by_symbol_projection(candidates, bot_owned_positions, ctx)
         performance_block = build_performance_block(
@@ -379,6 +406,7 @@ class CycleRunner:
                 if self._performance else {}
             ),
             now=datetime.now(timezone.utc),
+            earnings_lookup=self._earnings_lookup,
         )
         # Drop any LLM-emitted action that targets a position we're
         # already directive-closing (so we don't double-close and
@@ -497,6 +525,7 @@ class CycleRunner:
         self._log.info("[universe] refreshed → %s", ctx.universe.summary_line())
         self._cache_instrument_metadata(ctx.universe, ctx.instrument_metas)
         self._refresh_fundamentals(ctx.universe)
+        self._refresh_earnings_calendar(ctx.universe)
         self._publish_universe(ctx.universe)
         self.emit_universe_change(ctx.universe)
 
@@ -559,6 +588,31 @@ class CycleRunner:
                 "[fundamentals] refreshed=%d failed=%d skipped=%d (cache size %d)",
                 refreshed, failed, skipped, len(self._fundamentals),
             )
+
+    def _refresh_earnings_calendar(self, universe: TrackedUniverse) -> None:
+        """Top up the earnings-date cache for the tracked symbols.
+
+        Budget-capped (``earnings_calendar.budget_per_refresh``) so a
+        big universe doesn't fan-out into a yfinance storm. Only fires
+        for the N symbols whose entries are stalest — the cache itself
+        decides what "stale" means via its TTL.
+        """
+        cal = self._earnings_calendar
+        if cal is None:
+            return
+        symbols = [universe.symbol_for_id.get(i, "") for i in universe.instrument_ids]
+        symbols = [s for s in symbols if s]
+        if not symbols:
+            return
+        budget = max(1, int(self._cfg.earnings_calendar.budget_per_refresh))
+        # Refresh only the first ``budget`` symbols; rotation across
+        # cycles is handled by the order ``TrackedUniverse`` returns,
+        # which is stable per cycle, so over a few cycles every name
+        # is touched.
+        for sym in symbols[:budget]:
+            cal.refresh(sym)
+            if self._stop_event is not None and self._stop_event.is_set():
+                return
 
     def _update_owned_instrument_ids(
         self,

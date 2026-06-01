@@ -93,6 +93,13 @@ class GuardrailsConfig:
     # amended to a token amount. Prevents the bot from posting
     # uselessly tiny trades (e.g. $3 that the broker would reject).
     min_amend_remainder_usd: float = 50.0
+    # Refuse new BUYs for any non-crypto, non-FX name whose next
+    # scheduled earnings call is inside this window. Earnings-day
+    # gaps are a fundamental gamble the technical signal cannot
+    # predict; this is the bot's "don't be SNOW-on-earnings-day" rule.
+    # Set to 0 (default) to disable. Requires the earnings calendar
+    # to be enabled in ``[earnings_calendar]``.
+    pre_earnings_buy_blackout_hours: int = 0
 
 
 @dataclass(frozen=True)
@@ -231,6 +238,38 @@ class FundamentalsConfig:
     failure_backoff_hours: float = 6.0
     budget_per_refresh: int = 8
     enrich_decision_prompt: bool = True
+
+
+@dataclass(frozen=True)
+class EarningsCalendarConfig:
+    """yfinance-backed earnings-date cache.
+
+    Wires the ``EarningsProximityTool`` and the
+    ``pre_earnings_*`` rules (one guardrail, one directive). All
+    knobs default to off so the feature is opt-in — flip ``enabled``
+    to True once you've decided you want pre-earnings positioning.
+
+    Fields
+    ------
+    enabled:
+        Master switch. False means the calendar isn't fetched, the
+        proximity tool is a no-op, and the pre-earnings rules can't
+        fire even if they're configured.
+    cache_path:
+        JSON document under ``data/``.
+    ttl_hours:
+        How long a fetched entry is considered fresh. Earnings dates
+        don't move intraday; 12 h is the right ballpark.
+    budget_per_refresh:
+        Cap on how many *stale* symbols we'll re-fetch per universe
+        refresh. yfinance throttles unauthenticated traffic; 6 keeps
+        refresh latency below ~3 s.
+    """
+
+    enabled: bool = False
+    cache_path: str = "data/earnings_cache.json"
+    ttl_hours: float = 12.0
+    budget_per_refresh: int = 6
 
 
 @dataclass
@@ -438,6 +477,7 @@ class AppConfig:
     control: ControlServiceConfig
     alerting: AlertingConfig
     position_review: PositionReviewConfigDC = PositionReviewConfigDC()
+    earnings_calendar: EarningsCalendarConfig = EarningsCalendarConfig()
 
     @property
     def is_paper(self) -> bool:
@@ -593,6 +633,11 @@ def load_config(
             toml=raw.get("position_review"),
             db=store.get_section("position_review"),
         )
+        earnings_calendar = _build_section(
+            EarningsCalendarConfig,
+            toml=raw.get("earnings_calendar"),
+            db=store.get_section("earnings_calendar"),
+        )
 
         if snapshot_on_first_run:
             merged_sections = {
@@ -605,7 +650,8 @@ def load_config(
                 "ai":              _section_to_dict(ai),
                 "tools":           _section_to_dict(tools),
                 "logging":         _section_to_dict(logging_cfg),
-                "position_review": _section_to_dict(position_review),
+                "position_review":   _section_to_dict(position_review),
+                "earnings_calendar": _section_to_dict(earnings_calendar),
             }
             store.snapshot_if_empty(merged_sections)
             # On second+ runs: pick up newly-added sections (e.g.
@@ -692,6 +738,7 @@ def load_config(
         control=control,
         alerting=alerting,
         position_review=position_review,
+        earnings_calendar=earnings_calendar,
     )
 
 

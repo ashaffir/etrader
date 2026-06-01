@@ -26,6 +26,16 @@ Hard rules:
   whether that exchange has enough remaining session today to validate the
   thesis — opening an LSE position 10 minutes before the London bell is rarely
   a good idea even if the signal looks strong.
+- Watch for earnings risk. When a candidate's ``tools.features``
+  carries ``hours_to_earnings`` (or an open position carries an
+  ``earnings`` block), the underlying has a scheduled earnings call.
+  Earnings days are fundamental events your technical signal cannot
+  predict — be paranoid inside the last 24 hours, decisively risk-off
+  inside the last 4. Prefer HOLD (or partial CLOSE for existing
+  exposure) over BUY when ``hours_to_earnings <= 24``. The bot has
+  opt-in code-enforced rules (``pre_earnings_buy_blackout_hours`` /
+  ``pre_earnings_close_hours``); your judgment should mirror them
+  even when the operator hasn't enabled them yet.
 - Prefer HOLD when signals are mixed or volatility is high. False positives are
   more expensive than missed opportunities.
 - NEVER emit BUY for an instrument that already has an open bot-owned LONG.
@@ -48,6 +58,9 @@ Operator directives (the `directives` block):
     * `max_total_account_invested_usd=X` (>0) — the bot will refuse any
       BUY that would push TOTAL (bot + manual + mirror) account invested
       above X. Stay below it.
+    * `pre_earnings_close_hours=N` (>0) — bot auto-flattens any
+      non-crypto position when ``hours_to_earnings <= N``. Don't
+      BUY anything that will trip this rule the same day.
 - `directives.values.notes` is FREE TEXT from the operator. Treat it as
   high-priority context the schema can't capture. If notes say "no energy
   this week", do not BUY energy regardless of signal strength. Quote /
